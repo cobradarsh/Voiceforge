@@ -1,1 +1,1 @@
-{ Filter = { Bundles = ( "com.apple.springboard", "com.apple.InCallService" ); Executables = ( "audiomxd", "mediaserverd" ); Mode = "Any"; }; }
+{ Filter = { Bundles = ( "com.apple.springboard" ); Executables = ( "audiomxd", "mediaserverd" ); Mode = "Any"; }; }

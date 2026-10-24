@@ -19,7 +19,7 @@
 			<key>label</key>
 			<string>Voice</string>
 			<key>footerText</key>
-			<string>The voice is applied to your microphone during calls. Change it here or with the purple VoiceForge button on the call screen (drag it to move it). In the in-call menu, Custom shows pitch values from 0.7 to 2.0; formants follow automatically.</string>
+			<string>The voice is applied to your microphone during calls. Change it here or with the purple VoiceForge button that floats over any call, including VoIP calls like WhatsApp and FaceTime (drag it to move it). In the in-call menu, Custom shows pitch values from 0.7 to 2.0; formants follow automatically.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -149,7 +149,7 @@
 			<key>label</key>
 			<string>Advanced</string>
 			<key>footerText</key>
-			<string>Process outside calls: applies the voice to any app recording through the system audio server (for testing). VoiceForge always writes a diagnostics file to /var/mobile/Documents/VoiceForge-diagnostics.txt (open it in Filza). Discovery logging also writes to the system log, tagged "VoiceForge:". Target: leave as auto (uplink voice stage vlc2). To try another stage from the diagnostics file, enter fn:subtype:bus, e.g. process:vlc2:0, process:nnet:0, multi:egt3:0, process:firf:0. Takes effect live, no reinstall.</string>
+			<string>Process outside calls: applies the voice to any app recording through the system audio server (for testing). VoiceForge always writes a diagnostics file to /var/mobile/Documents/VoiceForge-diagnostics.txt (open it in Filza). Discovery logging also writes to the system log, tagged "VoiceForge:". Target: leave as auto (uplink voice stage egt3). To try another stage from the diagnostics file, enter fn:subtype:bus, e.g. multi:egt3:0, process:vlc2:0, process:nnet:0, process:firf:0. Takes effect live, no reinstall.</string>
 		</dict>
 		<dict>
 			<key>cell</key>

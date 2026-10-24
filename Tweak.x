@@ -41,7 +41,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.4.0"
+#define VF_VERSION "0.5.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -215,6 +215,12 @@ static void vf_publish(void) {
     }
 }
 
+@interface VFInCallUI : NSObject
++ (instancetype)shared;
+- (void)callStateChanged;
+- (void)refreshFromPrefs;
+@end
+
 @interface VFCallWatcher : NSObject <CXCallObserverDelegate>
 @property (nonatomic, strong) CXCallObserver *observer;
 @end
@@ -237,6 +243,7 @@ static void vf_publish(void) {
         if (!call.hasEnded) active = YES;
     sInCall = active;
     vf_publish();
+    [[VFInCallUI shared] callStateChanged];
 }
 @end
 
@@ -244,6 +251,7 @@ static VFCallWatcher *sCallWatcher;
 
 static void vf_prefs_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
     vf_publish();
+    [[VFInCallUI shared] refreshFromPrefs];
 }
 
 // The in-call menu posts one Darwin notification per choice ("preset.N" or "pitch.N", pitch x100),
@@ -435,10 +443,10 @@ static void vf_refresh_format(VFSlot *s, AudioUnit unit) {
     }
 }
 
-// 'vlc2' = voice-level stage, late in mediaserverd's uplink voice chain on iOS 15-18.
-// It is a mono audio-effect unit near the end of the mic processing, so changing its output
-// reaches the caller with almost nothing applied after it. This is the auto default.
-#define kVFSubtypeVoiceLevel 'vlc2'
+// 'egt3' is a mono audio-effect unit in mediaserverd's uplink voice chain (iOS 15-18) that,
+// on test devices, carries the mic going to the caller; changing it reaches the other side.
+// This is the auto default; other stages can be chosen with the Target setting.
+#define kVFSubtypeVoiceStage 'egt3'
 
 static BOOL vf_target_matches(const VFSlot *s) {
     uint64_t t = sTarget;
@@ -446,7 +454,7 @@ static BOOL vf_target_matches(const VFSlot *s) {
     if (!subtype) {
         // auto: the uplink voice-level stage in mediaserverd (what carries the mic on this device),
         // or the microphone side of a voice-processing / remote I/O unit on setups that use one
-        if (s->desc.componentSubType == kVFSubtypeVoiceLevel && s->fn != VF_FN_RENDER) return YES;
+        if (s->desc.componentSubType == kVFSubtypeVoiceStage && s->fn != VF_FN_RENDER) return YES;
         return s->fn == VF_FN_RENDER && s->bus == 1 && s->desc.componentType == kAudioUnitType_Output &&
                (s->desc.componentSubType == kAudioUnitSubType_VoiceProcessingIO ||
                 s->desc.componentSubType == kAudioUnitSubType_RemoteIO);
@@ -692,10 +700,29 @@ static void vf_audio_init(void) {
 }
 
 // =====================================================================================
-// In-call screen (InCallService): floating button + voice menu
+// In-call overlay (SpringBoard): floating button + voice menu, shown over any active
+// call (cellular and VoIP such as WhatsApp or FaceTime).
 // =====================================================================================
 
-static int sICStateToken = -1;
+// A window and a root view that let touches fall through to whatever is underneath,
+// except on our own button and menu, so the overlay never blocks the call or the app below.
+@interface VFPassthroughView : UIView
+@end
+@implementation VFPassthroughView
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    return v == self ? nil : v;
+}
+@end
+
+@interface VFOverlayWindow : UIWindow
+@end
+@implementation VFOverlayWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *v = [super hitTest:point withEvent:event];
+    return v == self ? nil : v;
+}
+@end
 
 static const int kMenuPresets[] = { VF_PRESET_NORMAL, VF_PRESET_FEMALE, VF_PRESET_NARRATOR, VF_PRESET_DARK_LORD,
                                     VF_PRESET_TENOR, VF_PRESET_SMURF, VF_PRESET_CHIPMUNK, VF_PRESET_CUSTOM };
@@ -705,19 +732,18 @@ static const int kMenuCount = 8;
 static const int kLowPitches[] = { 70, 80, 90 };
 static const int kHighPitches[] = { 110, 120, 130, 140, 150, 160, 170, 180, 190, 200 };
 
-static uint64_t vf_ic_state(void) {
-    uint64_t s = 0;
-    if (sICStateToken >= 0) notify_get_state(sICStateToken, &s);
-    return s;
-}
-
-// pitchX100 > 0 selects Custom with that pitch; otherwise selects the preset as saved
-static void vf_ic_select(int preset, int pitchX100) {
-    char name[96];
-    if (pitchX100 > 0) snprintf(name, sizeof name, VF_SELECT_PREFIX "pitch.%d", pitchX100);
-    else snprintf(name, sizeof name, VF_SELECT_PREFIX "preset.%d", preset);
-    uint32_t r = notify_post(name);
-    if (r != NOTIFY_STATUS_OK) VFLog("notify_post(%{public}s) failed: %u", name, r);
+// The overlay runs in SpringBoard, so it writes the chosen voice straight to preferences
+// and republishes to the audio server (no cross-process notification needed).
+static void vf_apply_selection(int preset, int pitchX100) {
+    CFPreferencesSetAppValue(CFSTR("preset"), (__bridge CFNumberRef)@(preset), VF_PREFS_DOMAIN);
+    CFPreferencesSetAppValue(CFSTR("enabled"), kCFBooleanTrue, VF_PREFS_DOMAIN);
+    if (pitchX100 > 0) {
+        double pitch = pitchX100 / 100.0, formant = round(pow(pitch, 0.33) * 100) / 100;
+        CFPreferencesSetAppValue(CFSTR("customPitch"), (__bridge CFNumberRef)@(pitch), VF_PREFS_DOMAIN);
+        CFPreferencesSetAppValue(CFSTR("customFormant"), (__bridge CFNumberRef)@(formant), VF_PREFS_DOMAIN);
+    }
+    CFPreferencesAppSynchronize(VF_PREFS_DOMAIN);
+    vf_publish();
 }
 
 static NSString *vf_short_title(int preset) {
@@ -726,15 +752,9 @@ static NSString *vf_short_title(int preset) {
     return @"Voice";
 }
 
-@interface VFInCallUI : NSObject
-+ (instancetype)shared;
-- (void)attachTo:(UIView *)host preferred:(BOOL)preferred;
-- (void)stateChanged;
-@end
-
 @implementation VFInCallUI {
-    __weak UIView *_host;
-    BOOL _hostPreferred;   // attached to the voice-call screen itself (not the fallback root)
+    VFOverlayWindow *_window;
+    UIView *_host;         // the overlay window's root view (full screen)
     UIButton *_button;
     UIControl *_backdrop;
     UIVisualEffectView *_panel;
@@ -764,19 +784,81 @@ static NSString *vf_short_title(int preset) {
 }
 
 - (void)readState {
-    uint64_t st = vf_ic_state();
-    _shownPreset = VF_ST_PRESET(st);
-    _shownPitch = (int)lroundf(VF_ST_PITCH(st) * 100);
-    _enabled = (st & VF_ST_ENABLED) != 0;
+    _shownPreset = (int)vf_pref_double(@"preset", 0);
+    if (_shownPreset < 0 || _shownPreset >= VF_PRESET_COUNT) _shownPreset = 0;
+    _shownPitch = (int)lround(fmin(fmax(vf_pref_double(@"customPitch", 1.3), 0.5), 2.5) * 100);
+    _enabled = vf_pref_bool(@"enabled", YES);
 }
 
-- (void)stateChanged {
-    [self readState];
-    if (vf_ic_state() & VF_ST_HIDE_BUTTON) {
-        [self detach];
-        return;
+// called by the call watcher whenever any call starts or ends
+- (void)callStateChanged {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (sInCall && vf_pref_bool(@"inCallButton", YES)) [self show];
+        else [self hide];
+    });
+}
+
+- (void)refreshFromPrefs {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_window && !self->_window.hidden) {
+            [self readState];
+            [self refresh];
+        }
+    });
+}
+
+- (void)ensureWindow {
+    if (_window) return;
+    VFOverlayWindow *w = nil;
+    if (@available(iOS 13.0, *)) {
+        UIWindowScene *best = nil;
+        for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+            if (![scene isKindOfClass:UIWindowScene.class]) continue;
+            if (scene.activationState == UISceneActivationStateForegroundActive) { best = (UIWindowScene *)scene; break; }
+            if (!best) best = (UIWindowScene *)scene;
+        }
+        if (best) w = [[VFOverlayWindow alloc] initWithWindowScene:best];
     }
+    if (!w) w = [[VFOverlayWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+    w.windowLevel = UIWindowLevelAlert + 1000;
+    w.backgroundColor = UIColor.clearColor;
+    w.hidden = YES;
+    UIViewController *vc = [UIViewController new];
+    VFPassthroughView *root = [[VFPassthroughView alloc] initWithFrame:w.bounds];
+    root.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    root.backgroundColor = UIColor.clearColor;
+    vc.view = root;
+    w.rootViewController = vc;
+    _window = w;
+    _host = root;
+    if (!_button) _button = [self makeButton];
+    [_host addSubview:_button];
+    [self updateButton];
+    [self positionButton];
+    VFLog("overlay window created (scene=%d)", _window.windowScene != nil);
+}
+
+- (void)positionButton {
+    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"VoiceForgeButtonCenter.v2"];
+    CGPoint c = saved ? CGPointFromString(saved)
+                      : CGPointMake(_host.bounds.size.width - 16 - _button.bounds.size.width / 2,
+                                    _host.safeAreaInsets.top + 205);
+    _button.center = [self clamp:c];
+}
+
+- (void)show {
+    [self ensureWindow];
+    [self readState];
+    _window.hidden = NO;
+    [_host bringSubviewToFront:_button];
+    [self updateButton];
+    [self positionButton];
     [self refresh];
+}
+
+- (void)hide {
+    [self closeMenu];
+    if (_window) _window.hidden = YES;
 }
 
 // ------------------------------------------------------------------ button
@@ -834,43 +916,6 @@ static NSString *vf_short_title(int preset) {
         _button.center = [self clamp:_button.center];
         [NSUserDefaults.standardUserDefaults setObject:NSStringFromCGPoint(_button.center) forKey:@"VoiceForgeButtonCenter.v2"];
     }
-}
-
-- (void)attachTo:(UIView *)host preferred:(BOOL)preferred {
-    [self readState];
-    if (vf_ic_state() & VF_ST_HIDE_BUTTON) {
-        [self detach];
-        return;
-    }
-    UIView *current = _host;
-    // keep the button on the call screen; the root view is only a fallback
-    if (!preferred && _hostPreferred && current.window && current != host) return;
-    if (current == host && _button.superview == host) {
-        [host bringSubviewToFront:_button];
-        [self refresh];
-        return;
-    }
-    [self closeMenu];
-    _host = host;
-    _hostPreferred = preferred;
-    if (!_button) _button = [self makeButton];
-    [host addSubview:_button];
-    [self updateButton];
-    // default: right edge, below where other in-call buttons usually sit
-    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"VoiceForgeButtonCenter.v2"];
-    CGPoint c = saved ? CGPointFromString(saved)
-                      : CGPointMake(host.bounds.size.width - 16 - _button.bounds.size.width / 2,
-                                    host.safeAreaInsets.top + 205);
-    _button.center = [self clamp:c];
-    [self refresh];
-    VFLog("in-call button attached to %{public}@ (%{public}s)", NSStringFromClass(host.class),
-          preferred ? "call screen" : "fallback root");
-}
-
-- (void)detach {
-    [self closeMenu];
-    [_button removeFromSuperview];
-    _host = nil;
 }
 
 // ------------------------------------------------------------------ menu
@@ -1024,12 +1069,12 @@ static NSString *vf_short_title(int preset) {
     _shownPreset = preset;
     if (preset == VF_PRESET_CUSTOM) {
         if (_shownPitch < 50) _shownPitch = 130;
-        vf_ic_select(preset, _shownPitch);
+        vf_apply_selection(preset, _shownPitch);
         _customOpen = YES;
         [self buildPanel];
         return;
     }
-    vf_ic_select(preset, 0);
+    vf_apply_selection(preset, 0);
     if (_customOpen) {
         _customOpen = NO;
         [self buildPanel];
@@ -1045,46 +1090,11 @@ static NSString *vf_short_title(int preset) {
     _enabled = YES;
     _shownPreset = VF_PRESET_CUSTOM;
     _shownPitch = (int)b.tag;
-    vf_ic_select(VF_PRESET_CUSTOM, _shownPitch);
+    vf_apply_selection(VF_PRESET_CUSTOM, _shownPitch);
     [self refresh];
 }
 
 @end
-
-static void vf_ic_state_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [[VFInCallUI shared] stateChanged];
-    });
-}
-
-%group VFInCall
-
-%hook UIViewController
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-    NSString *cls = NSStringFromClass(self.class);
-    static NSMutableSet<NSString *> *seen;
-    if (!seen) seen = [NSMutableSet set];
-    if (![seen containsObject:cls]) {
-        [seen addObject:cls];
-        VFLog("InCallService screen appeared: %{public}@", cls);
-    }
-    // PHAudioCallViewController is the voice-call screen (matched loosely across iOS versions);
-    // PHInCallRootViewController hosts it and is the fallback
-    BOOL callScreen = [cls containsString:@"AudioCallViewController"];
-    if (callScreen || [cls containsString:@"InCallRootViewController"])
-        [[VFInCallUI shared] attachTo:self.view preferred:callScreen];
-}
-%end
-
-%end
-
-static void vf_incall_init(void) {
-    notify_register_check(VF_STATE_NAME, &sICStateToken);
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_ic_state_changed,
-                                    CFSTR(VF_STATE_NAME), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-    VFLog("loaded into InCallService, state token %d, state=0x%llx", sICStateToken, vf_ic_state());
-}
 
 %ctor {
     const char *name = getprogname();
@@ -1094,8 +1104,5 @@ static void vf_incall_init(void) {
         %init(VFAudio);
     } else if ([bundleID isEqualToString:@"com.apple.springboard"]) {
         vf_springboard_init();
-    } else if ([bundleID isEqualToString:@"com.apple.InCallService"]) {
-        vf_incall_init();
-        %init(VFInCall);
     }
 }

@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define VF_PI 3.14159265358979323846f
-#define VF_OSAMP 4
+#define VF_OSAMP 8   // STFT overlap factor; higher = smoother, less "roughness"
 
 struct VFEngine {
     double sr;
@@ -47,7 +47,7 @@ static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] 
     [VF_PRESET_DARK_LORD] = { "Dark Lord",     { 0.62f, 0.75f,  3.0f, 1.0f } },
     [VF_PRESET_TENOR]     = { "Tenor",         { 0.80f, 0.80f,  0.0f, 0.0f } },
     [VF_PRESET_NARRATOR]  = { "Deep Narrator", { 0.82f, 0.90f,  5.0f, 1.0f } },
-    [VF_PRESET_FEMALE]    = { "Female",        { 1.70f, 1.18f, -2.0f, 0.0f } },
+    [VF_PRESET_FEMALE]    = { "Female",        { 1.55f, 1.26f, -3.5f, 0.0f } },
     [VF_PRESET_SMURF]     = { "Smurf",         { 1.60f, 1.60f,  0.0f, 0.0f } },
     [VF_PRESET_CHIPMUNK]  = { "Chipmunk",      { 2.20f, 2.20f,  0.0f, 0.0f } },
     [VF_PRESET_CUSTOM]    = { "Custom",        { 1.00f, 1.00f,  0.0f, 0.0f } },
@@ -331,7 +331,8 @@ static void process_frame(VFEngine *e) {
     fft(e, e->re, e->im, 1);
 
     // overlap-add: periodic Hann analysis*synthesis at 4x overlap sums to 1.5
-    float scale = 1.0f / (N * 1.5f);
+    // Hann analysis*synthesis at this overlap sums to N * OSAMP * mean(Hann^2), mean(Hann^2)=0.375
+    float scale = 1.0f / (N * VF_OSAMP * 0.375f);
     for (int k = 0; k < N; k++) e->outAccum[k] += e->re[(k + half) & (N - 1)] * e->win[k] * scale;
     memcpy(e->outFifo, e->outAccum, e->hop * sizeof(float));
     memmove(e->outAccum, e->outAccum + e->hop, N * sizeof(float));

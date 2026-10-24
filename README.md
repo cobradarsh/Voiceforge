@@ -8,7 +8,7 @@ Written from scratch; it shares no code with VoiceChanger XS.
 | Voice | Pitch | Formant | Notes |
 |---|---|---|---|
 | Normal (Off) | 1.00 | 1.00 | pass-through |
-| Female | 1.70 | 1.18 | raises pitch ~9 semitones, shortens the vocal tract |
+| Female | 1.55 | 1.26 | raised pitch and vocal-tract size for a feminine voice |
 | Deep Narrator | 0.82 | 0.90 | ~3.5 semitones down, +5 dB warmth at 180 Hz |
 | Dark Lord | 0.62 | 0.75 | monster voice |
 | Tenor | 0.80 | 0.80 | classic pitch-down |
@@ -42,22 +42,19 @@ With Theos installed locally: `make package FINALPACKAGE=1` (roothide by default
 
 ### In-call button
 
-During a call, a pill-shaped **VoiceForge** button sits on the right of the call screen showing
-the current voice ("Voice" when off; purple while a voice is active). Drag it anywhere. Tap it for
-the voice menu: Off, Female, Narrator, Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom**
-opens the pitch grid (0.7 · 0.8 · 0.9 | 1.1 … 2.0) for fine-tuning; formants follow the pitch
-automatically (formant = pitch^0.33). Turn the button off with Settings → VoiceForge → In-call button.
-
-If another voice-changer tweak is installed, its own in-call button and menu are separate from
-VoiceForge's; uninstall it to avoid two tweaks changing the call audio.
+During **any** call, cellular or VoIP (WhatsApp, FaceTime, etc.), a purple **VoiceForge** pill
+floats on the screen showing the current voice. It is drawn by a system overlay, so it appears
+over the app you are calling in. Drag it anywhere. Tap it for the voice menu: Off, Female,
+Narrator, Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom** opens the pitch grid
+(0.7 - 2.0) for fine-tuning; formants follow the pitch automatically. Turn the button off with
+Settings -> VoiceForge -> In-call button.
 
 ## Finding the call audio path (first-time setup)
 
 **On iOS 15-18 the call mic audio runs through a chain of audio-effect units in `mediaserverd`**, not
-through a voice-processing I/O unit. VoiceForge's auto target is the `vlc2` (voice-level) stage near the
-end of that uplink chain. If your voice still doesn't change, open the diagnostics file, find a mono
-`float32` unit while `audio-inCall=1`, and set **Target** to it, e.g. `process:vlc2:0`, `process:nnet:0`,
-`multi:egt3:0`, or `process:firf:0`. The Target field applies live, with no reinstall.
+through a voice-processing I/O unit. VoiceForge's auto target is the `egt3` stage in that uplink chain (confirmed on an iPhone 14 Pro Max,
+iOS 16.5). If your voice still doesn't change, open the diagnostics file, find a mono
+`float32` unit while `audio-inCall=1`, and set **Target** to it, e.g. `multi:egt3:0`, `process:vlc2:0`, `process:nnet:0`, or `process:firf:0`. The Target field applies live, with no reinstall.
 
 VoiceForge writes `/var/mobile/Documents/VoiceForge-diagnostics.txt` (open it in Filza). It records
 whether `audiomxd` loaded the tweak and could read the settings, what SpringBoard published, and
