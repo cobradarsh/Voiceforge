@@ -53,6 +53,11 @@ VoiceForge's; uninstall it to avoid two tweaks changing the call audio.
 
 ## Finding the call audio path (first-time setup)
 
+VoiceForge writes `/var/mobile/Documents/VoiceForge-diagnostics.txt` (open it in Filza). It records
+whether `audiomxd` loaded the tweak and could read the settings, what SpringBoard published, and
+every audio unit and audio converter the audio server uses, refreshed when a call starts. Make a
+short call while talking, then share that file to find the right target.
+
 Apple doesn't document which audio unit carries the uplink (your voice) during a cellular call,
 and it differs between iOS versions. VoiceForge hooks the public AudioToolbox entry points and
 defaults to the microphone side of the voice-processing I/O unit (`render:vpio:1`). If the voice

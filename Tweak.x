@@ -13,6 +13,7 @@
 #import <notify.h>
 #import <os/log.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <string.h>
 #include "VFDSP.h"
 
@@ -40,12 +41,113 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
+#define VF_VERSION "0.3.0"
+
+// Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
+// names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
+//   word b: [0..3] kind, [4..7] fn, [8..15] bus/preset/input kHz, [16..23] channels,
+//           [24..43] sample rate, 44 float, 45 non-interleaved, [46..51] bits, 52 audio-side inCall,
+//           53 target match, 54 wants processing, 55 mediaserverd, [56..63] frames/16
+#define VF_DIAG_PREFIX    "com.voiceforge.diag."
+#define VF_DIAG_SLOTS     16
+#define VF_DIAG_PATH      @"/var/mobile/Documents/VoiceForge-diagnostics.txt"
+enum { VF_DIAG_LOAD = 1, VF_DIAG_UNIT = 2, VF_DIAG_CONVERTER = 3, VF_DIAG_PROCESSING = 4 };
+
 // =====================================================================================
 // SpringBoard side
 // =====================================================================================
 
 static int sSBStateToken = -1, sSBTargetToken = -1;
 static BOOL sInCall;
+
+static dispatch_queue_t sSBDiagQueue;
+static int sSBDiagA[VF_DIAG_SLOTS], sSBDiagB[VF_DIAG_SLOTS];
+static uint64_t sLastPublished = ~0ULL;
+
+static void vf_diag_write(NSString *line) {
+    if (!sSBDiagQueue) return;
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [NSDateFormatter new];
+        fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss.SSS";
+    });
+    NSString *stamped = [NSString stringWithFormat:@"[%@] %@\n", [fmt stringFromDate:[NSDate date]], line];
+    dispatch_async(sSBDiagQueue, ^{
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSString *path = VF_DIAG_PATH, *old = [VF_DIAG_PATH stringByAppendingString:@".old"];
+        if ([[fm attributesOfItemAtPath:path error:nil] fileSize] > 512 * 1024) {
+            [fm removeItemAtPath:old error:nil];
+            [fm moveItemAtPath:path toPath:old error:nil];
+        }
+        if (![fm fileExistsAtPath:path]) [fm createFileAtPath:path contents:nil attributes:nil];
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+        [h seekToEndOfFile];
+        [h writeData:[stamped dataUsingEncoding:NSUTF8StringEncoding]];
+        [h closeFile];
+    });
+}
+
+static NSString *vf_cc(uint32_t v) {
+    char b[5];
+    for (int i = 0; i < 4; i++) {
+        char c = (char)((v >> (24 - 8 * i)) & 0xff);
+        b[i] = (c >= 32 && c < 127) ? c : '?';
+    }
+    b[4] = 0;
+    return [NSString stringWithUTF8String:b];
+}
+
+static NSString *vf_diag_describe(uint64_t a, uint64_t b) {
+    int kind = (int)(b & 0xf), fn = (int)((b >> 4) & 0xf), bus = (int)((b >> 8) & 0xff);
+    int ch = (int)((b >> 16) & 0xff), bits = (int)((b >> 46) & 0x3f), frames = (int)((b >> 56) & 0xff) * 16;
+    unsigned rate = (unsigned)((b >> 24) & 0xfffff);
+    BOOL isFloat = (b >> 44) & 1, nonInt = (b >> 45) & 1, inCall = (b >> 52) & 1, match = (b >> 53) & 1, want = (b >> 54) & 1;
+    NSString *proc = ((b >> 55) & 1) ? @"mediaserverd" : @"audiomxd";
+    NSString *fmt = [NSString stringWithFormat:@"%uHz ch=%d %@%d%@", rate, ch, isFloat ? @"float" : @"int", bits,
+                     nonInt ? @" non-interleaved" : @""];
+    NSArray *fns = @[ @"any", @"render", @"process", @"multi" ];
+    NSString *fnName = fn < (int)fns.count ? fns[fn] : @"?";
+    switch (kind) {
+        case VF_DIAG_LOAD:
+            return [NSString stringWithFormat:@"%@ loaded VoiceForge: settings %@, read state=0x%llx (enabled=%d preset=%d inCall=%d)",
+                    proc, bus ? @"READABLE" : @"NOT READABLE", a, (int)((a >> 8) & 1), (int)(a & 0xff), (int)((a >> 9) & 1)];
+        case VF_DIAG_UNIT:
+            return [NSString stringWithFormat:@"%@ unit %@/%@ %@ bus=%d %@ frames~%d | audio-inCall=%d target-match=%d wants-processing=%d",
+                    proc, vf_cc((uint32_t)(a >> 32)), vf_cc((uint32_t)a), fnName, bus, fmt, frames, inCall, match, want];
+        case VF_DIAG_PROCESSING:
+            return [NSString stringWithFormat:@"%@ PROCESSING %@/%@ %@ %@ with preset %d",
+                    proc, vf_cc((uint32_t)(a >> 32)), vf_cc((uint32_t)a), fnName, fmt, bus];
+        case VF_DIAG_CONVERTER:
+            return [NSString stringWithFormat:@"%@ converter %@ -> %@ (%@) in=%dkHz out=%@ frames~%d | audio-inCall=%d",
+                    proc, vf_cc((uint32_t)(a >> 32)), vf_cc((uint32_t)a), fn == 1 ? @"convert" : @"fill", bus, fmt, frames, inCall];
+        default:
+            return [NSString stringWithFormat:@"%@ unknown event 0x%llx 0x%llx", proc, a, b];
+    }
+}
+
+static void vf_diag_received(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
+    NSString *name = (__bridge NSString *)n;
+    int i = [name substringFromIndex:strlen(VF_DIAG_PREFIX)].intValue;
+    if (i < 0 || i >= VF_DIAG_SLOTS) return;
+    uint64_t a = 0, b = 0;
+    notify_get_state(sSBDiagA[i], &a);
+    notify_get_state(sSBDiagB[i], &b);
+    vf_diag_write([vf_diag_describe(a, b) stringByAppendingFormat:@" | SpringBoard-inCall=%d", sInCall ? 1 : 0]);
+}
+
+static void vf_diag_springboard_init(void) {
+    sSBDiagQueue = dispatch_queue_create("com.voiceforge.diagfile", DISPATCH_QUEUE_SERIAL);
+    for (int i = 0; i < VF_DIAG_SLOTS; i++) {
+        sSBDiagA[i] = sSBDiagB[i] = -1;
+        notify_register_check([NSString stringWithFormat:@VF_DIAG_PREFIX "%d.a", i].UTF8String, &sSBDiagA[i]);
+        notify_register_check([NSString stringWithFormat:@VF_DIAG_PREFIX "%d.b", i].UTF8String, &sSBDiagB[i]);
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_diag_received,
+                                        (__bridge CFStringRef)[NSString stringWithFormat:@VF_DIAG_PREFIX "%d", i],
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    }
+    vf_diag_write(@"===== SpringBoard loaded VoiceForge " VF_VERSION " =====");
+}
 
 static id vf_pref(NSString *key) {
     return CFBridgingRelease(CFPreferencesCopyAppValue((__bridge CFStringRef)key, VF_PREFS_DOMAIN));
@@ -104,6 +206,13 @@ static void vf_publish(void) {
     notify_set_state(sSBStateToken, s);
     notify_post(VF_TARGET_NAME);
     notify_post(VF_STATE_NAME);
+
+    if (s != sLastPublished) {
+        sLastPublished = s;
+        vf_diag_write([NSString stringWithFormat:@"SpringBoard published: enabled=%d preset=%d (%s) inCall=%d custom pitch=%.2f formant=%.2f target=%@",
+                       (s & VF_ST_ENABLED) ? 1 : 0, preset, vf_preset_name((VFPreset)preset), sInCall ? 1 : 0,
+                       pitch / 100.0, formant / 100.0, [spec isKindOfClass:NSString.class] ? spec : @"auto"]);
+    }
 }
 
 @interface VFCallWatcher : NSObject <CXCallObserverDelegate>
@@ -172,6 +281,7 @@ static void vf_observe_select(NSString *suffix) {
 }
 
 static void vf_springboard_init(void) {
+    vf_diag_springboard_init();
     notify_register_check(VF_STATE_NAME, &sSBStateToken);
     notify_register_check(VF_TARGET_NAME, &sSBTargetToken);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_prefs_changed,
@@ -188,7 +298,7 @@ static void vf_springboard_init(void) {
 // Audio server side
 // =====================================================================================
 
-#define VF_MAX_SLOTS 32
+#define VF_MAX_SLOTS 64
 #define VF_CHUNK 4096
 
 typedef struct {
@@ -201,6 +311,8 @@ typedef struct {
     int fmtValid;
     uint32_t fmtAge;
     uint32_t seenGen;                    // log / params generation last applied
+    uint32_t reportedGen;                // diagnostics generation last reported
+    uint32_t callsSinceReport;
     VFEngine *engine;
     float *scratch;
 } VFSlot;
@@ -209,6 +321,46 @@ static VFSlot sSlots[VF_MAX_SLOTS];
 static int sAudioStateToken = -1, sAudioTargetToken = -1;
 static uint64_t sState, sTarget;
 static volatile uint32_t sGen = 1;
+
+static dispatch_queue_t sDiagQueue;
+static int sDiagA[VF_DIAG_SLOTS], sDiagB[VF_DIAG_SLOTS];
+static BOOL sIsMediaserverd;
+
+// rare events only (new units, state changes); never called per buffer
+static void vf_diag_send(uint64_t a, uint64_t b) {
+    if (!sDiagQueue) return;
+    if (sIsMediaserverd) b |= 1ULL << 55;
+    dispatch_async(sDiagQueue, ^{
+        static int next;
+        int i = next++ % VF_DIAG_SLOTS;
+        if (sDiagA[i] < 0 || sDiagB[i] < 0) return;
+        notify_set_state(sDiagA[i], a);
+        notify_set_state(sDiagB[i], b);
+        char name[64];
+        snprintf(name, sizeof name, VF_DIAG_PREFIX "%d", i);
+        notify_post(name);
+        usleep(15000);   // let SpringBoard read the slot before the ring wraps
+    });
+}
+
+static uint64_t vf_diag_fmt(const AudioStreamBasicDescription *f) {
+    uint64_t b = (uint64_t)(f->mChannelsPerFrame & 0xff) << 16;
+    b |= (uint64_t)((uint32_t)f->mSampleRate & 0xfffff) << 24;
+    if (f->mFormatFlags & kAudioFormatFlagIsFloat) b |= 1ULL << 44;
+    if (f->mFormatFlags & kAudioFormatFlagIsNonInterleaved) b |= 1ULL << 45;
+    b |= (uint64_t)(f->mBitsPerChannel & 0x3f) << 46;
+    return b;
+}
+
+static uint64_t vf_diag_word(int kind, int fn, UInt32 field, const AudioStreamBasicDescription *f, UInt32 frames,
+                             BOOL match, BOOL want) {
+    uint64_t b = (uint64_t)kind | (uint64_t)(fn & 0xf) << 4 | (uint64_t)(field & 0xff) << 8 | vf_diag_fmt(f);
+    if (sState & VF_ST_INCALL) b |= 1ULL << 52;
+    if (match) b |= 1ULL << 53;
+    if (want) b |= 1ULL << 54;
+    b |= (uint64_t)(frames / 16 > 255 ? 255 : frames / 16) << 56;
+    return b;
+}
 
 static void vf_refresh_state(void) {
     int changed = 0;
@@ -259,6 +411,8 @@ static VFSlot *vf_slot(AudioUnit unit, int fn, UInt32 bus) {
             s->fmtValid = 0;
             s->fmtAge = 0;
             s->seenGen = 0;
+            s->reportedGen = 0;
+            s->callsSinceReport = 0;
             memset(&s->desc, 0, sizeof s->desc);
             AudioComponent comp = AudioComponentInstanceGetComponent(unit);
             if (comp) AudioComponentGetDescription(comp, &s->desc);
@@ -374,7 +528,6 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
     BOOL debug = (st & VF_ST_DEBUG) != 0;
     BOOL wantProcess = (st & VF_ST_ENABLED) && VF_ST_PRESET(st) != VF_PRESET_NORMAL &&
                        (st & (VF_ST_INCALL | VF_ST_ALWAYS));
-    if (!debug && !wantProcess) return;
 
     VFSlot *s = vf_slot(unit, fn, bus);
     if (!s) return;
@@ -383,8 +536,14 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
 
     uint32_t gen = __atomic_load_n(&sGen, __ATOMIC_RELAXED);
     BOOL match = vf_target_matches(s);
-    BOOL newGen = s->seenGen != gen;
-    if (debug && newGen) vf_log_slot(s, frames, match);
+    // report each active unit on every state change (e.g. call start) and every few thousand buffers
+    if (s->reportedGen != gen || ++s->callsSinceReport >= 4000) {
+        s->reportedGen = gen;
+        s->callsSinceReport = 0;
+        vf_diag_send(((uint64_t)s->desc.componentType << 32) | s->desc.componentSubType,
+                     vf_diag_word(VF_DIAG_UNIT, fn, bus, &s->fmt, frames, match, wantProcess));
+        if (debug) vf_log_slot(s, frames, match);
+    }
     if (!match || !wantProcess) {
         s->seenGen = gen;
         return;
@@ -393,8 +552,56 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
     if (s->seenGen != gen) {
         vf_set_params(s->engine, vf_preset_params((VFPreset)VF_ST_PRESET(st), VF_ST_PITCH(st), VF_ST_FORMANT(st)));
         s->seenGen = gen;
+        vf_diag_send(((uint64_t)s->desc.componentType << 32) | s->desc.componentSubType,
+                     vf_diag_word(VF_DIAG_PROCESSING, fn, (UInt32)VF_ST_PRESET(st), &s->fmt, frames, match, wantProcess));
     }
     vf_process_abl(s, abl, frames);
+}
+
+// ---- audio converters (reported for diagnostics only)
+
+typedef struct {
+    void *volatile conv;
+    int fn;
+    uint32_t calls;
+    uint32_t reportedGen;
+} VFConvSlot;
+
+static VFConvSlot sConvs[64];
+
+static void vf_converter_seen(AudioConverterRef conv, int fn, UInt32 frames) {
+    if (!conv || !sDiagQueue) return;
+    vf_refresh_state();
+    VFConvSlot *c = NULL;
+    for (int i = 0; i < 64 && !c; i++)
+        if (sConvs[i].conv == conv && sConvs[i].fn == fn) c = &sConvs[i];
+    for (int i = 0; i < 64 && !c; i++) {
+        void *expected = NULL;
+        if (!sConvs[i].conv && __atomic_compare_exchange_n(&sConvs[i].conv, &expected, (void *)conv, false,
+                                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            c = &sConvs[i];
+            c->fn = fn;
+            c->calls = 0;
+            c->reportedGen = 0;
+        }
+    }
+    if (!c) return;
+    uint32_t gen = __atomic_load_n(&sGen, __ATOMIC_RELAXED);
+    if (c->reportedGen == gen && ++c->calls < 4000) return;
+    c->reportedGen = gen;
+    c->calls = 0;
+    AudioStreamBasicDescription in = {0}, out = {0};
+    UInt32 size = sizeof in;
+    AudioConverterGetProperty(conv, kAudioConverterCurrentInputStreamDescription, &size, &in);
+    size = sizeof out;
+    AudioConverterGetProperty(conv, kAudioConverterCurrentOutputStreamDescription, &size, &out);
+    vf_diag_send(((uint64_t)in.mFormatID << 32) | out.mFormatID,
+                 vf_diag_word(VF_DIAG_CONVERTER, fn, (UInt32)(in.mSampleRate / 1000), &out, frames, NO, NO));
+}
+
+static void vf_release_converter(AudioConverterRef conv) {
+    for (int i = 0; i < 64; i++)
+        if (sConvs[i].conv == conv) __atomic_store_n(&sConvs[i].conv, NULL, __ATOMIC_RELEASE);
 }
 
 static void vf_release_unit(AudioComponentInstance unit) {
@@ -437,14 +644,44 @@ static void vf_release_unit(AudioComponentInstance unit) {
     return %orig;
 }
 
+%hookf(OSStatus, AudioConverterConvertComplexBuffer, AudioConverterRef conv, UInt32 frames, const AudioBufferList *inData, AudioBufferList *outData) {
+    OSStatus r = %orig;
+    if (r == noErr) vf_converter_seen(conv, 1, frames);
+    return r;
+}
+
+%hookf(OSStatus, AudioConverterFillComplexBuffer, AudioConverterRef conv, AudioConverterComplexInputDataProc proc, void *userData, UInt32 *ioPackets, AudioBufferList *outData, AudioStreamPacketDescription *outDesc) {
+    OSStatus r = %orig;
+    vf_converter_seen(conv, 2, ioPackets ? *ioPackets : 0);
+    return r;
+}
+
+%hookf(OSStatus, AudioConverterDispose, AudioConverterRef conv) {
+    vf_release_converter(conv);
+    return %orig;
+}
+
 %end
 
 static void vf_audio_init(void) {
-    notify_register_check(VF_STATE_NAME, &sAudioStateToken);
+    sIsMediaserverd = !strcmp(getprogname(), "mediaserverd");
+    for (int i = 0; i < VF_DIAG_SLOTS; i++) {
+        char name[64];
+        sDiagA[i] = sDiagB[i] = -1;
+        snprintf(name, sizeof name, VF_DIAG_PREFIX "%d.a", i);
+        notify_register_check(name, &sDiagA[i]);
+        snprintf(name, sizeof name, VF_DIAG_PREFIX "%d.b", i);
+        notify_register_check(name, &sDiagB[i]);
+    }
+    sDiagQueue = dispatch_queue_create("com.voiceforge.diag", DISPATCH_QUEUE_SERIAL);
+
+    uint32_t r = notify_register_check(VF_STATE_NAME, &sAudioStateToken);
     notify_register_check(VF_TARGET_NAME, &sAudioTargetToken);
-    notify_get_state(sAudioStateToken, &sState);
+    uint32_t g = notify_get_state(sAudioStateToken, &sState);
     notify_get_state(sAudioTargetToken, &sTarget);
-    VFLog("loaded into %{public}s, state=0x%llx target=0x%llx", getprogname(), sState, sTarget);
+    BOOL readable = r == NOTIFY_STATUS_OK && g == NOTIFY_STATUS_OK && sAudioStateToken >= 0;
+    VFLog("loaded into %{public}s, state=0x%llx target=0x%llx readable=%d", getprogname(), sState, sTarget, readable);
+    vf_diag_send(sState, VF_DIAG_LOAD | (readable ? 1ULL << 8 : 0));
 }
 
 // =====================================================================================

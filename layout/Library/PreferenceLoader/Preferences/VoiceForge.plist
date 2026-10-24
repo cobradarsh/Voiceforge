@@ -149,7 +149,7 @@
 			<key>label</key>
 			<string>Advanced</string>
 			<key>footerText</key>
-			<string>Process outside calls: applies the voice to any app recording through the system audio server (for testing). Discovery logging writes every audio unit the audio server uses to the system log, tagged "VoiceForge:". Target: leave as auto, or enter fn:subtype:bus (e.g. render:vpio:1, process:vp4 , any:auvp:*) from the discovery log.</string>
+			<string>Process outside calls: applies the voice to any app recording through the system audio server (for testing). VoiceForge always writes a diagnostics file to /var/mobile/Documents/VoiceForge-diagnostics.txt (open it in Filza). Discovery logging also writes to the system log, tagged "VoiceForge:". Target: leave as auto, or enter fn:subtype:bus (e.g. render:vpio:1, process:vp4 , any:auvp:*) from the discovery log.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
