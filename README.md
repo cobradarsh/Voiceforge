@@ -8,7 +8,7 @@ Written from scratch; it shares no code with VoiceChanger XS.
 | Voice | Pitch | Formant | Notes |
 |---|---|---|---|
 | Normal (Off) | 1.00 | 1.00 | pass-through |
-| Female | 1.55 | 1.26 | raised pitch and vocal-tract size for a feminine voice |
+| Female | 1.75 | 1.25 | raised pitch and vocal-tract size for a feminine voice |
 | Deep Narrator | 0.82 | 0.90 | ~3.5 semitones down, +5 dB warmth at 180 Hz |
 | Dark Lord | 0.62 | 0.75 | monster voice |
 | Tenor | 0.80 | 0.80 | classic pitch-down |
@@ -80,8 +80,10 @@ The **Process outside calls** switch applies the voice without a call, for quick
 
 ## Layout
 
-- `VFDSP.c/.h` — portable C engine: peak-locked phase-vocoder pitch shifter with cepstral
-  formant control, loudness matching, low-shelf and soft limiter. No allocation while processing.
+- `VFDSP.c/.h` — portable C engine: streaming TD-PSOLA pitch shifter (YIN pitch tracking,
+  pitch-synchronous grains) with formant control by grain resampling, low-shelf and soft limiter.
+  Keeps the voice periodic and natural; ~43 ms latency, ~2% of a core at 24 kHz. No allocation
+  while processing.
 - `Tweak.x` — SpringBoard side (settings + CallKit call state → `notify(3)` state word) and
   audio-server side (AudioToolbox hooks, format conversion, per-unit engines).
 - `layout/Library/PreferenceLoader/Preferences/VoiceForge.plist` — the Settings pane.

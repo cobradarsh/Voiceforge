@@ -41,7 +41,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.5.0"
+#define VF_VERSION "0.6.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.

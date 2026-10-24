@@ -93,7 +93,7 @@
 			<key>label</key>
 			<string>Custom voice</string>
 			<key>footerText</key>
-			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Female is pitch 1.70 / formant 1.18, Deep Narrator is 0.82 / 0.90. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
+			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Female is pitch 1.75 / formant 1.25, Deep Narrator is 0.82 / 0.90. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
 		</dict>
 		<dict>
 			<key>cell</key>

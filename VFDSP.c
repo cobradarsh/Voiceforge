@@ -1,45 +1,53 @@
 // VoiceForge DSP engine.
 //
-// Phase-vocoder pitch shifter (4x overlap STFT) using peak-locked shifting
-// (Laroche & Dolson): every spectral peak is moved together with the bins
-// around it and their phases are rotated as one unit, which avoids the warbly
-// "phasiness" of shifting each bin independently.
+// Streaming TD-PSOLA (time-domain pitch-synchronous overlap-add) for a single voice.
 //
-// A cepstral spectral envelope separates the voice's pitch from its formants
-// (the "size" of the vocal tract) so they can be moved independently. Shifting
-// pitch alone gives the classic chipmunk/monster sound; shifting pitch and
-// formants by different amounts is what makes a voice read as a different speaker.
+// The input is cut into two-period grains centred on its glottal pulses ("analysis marks",
+// one pitch period apart, found with the YIN pitch detector and aligned to the waveform by
+// cross-correlation). Grains are overlap-added at a new spacing ("synthesis marks", one
+// *output* period apart), so the output repeats real pulses of the speaker's voice at the new
+// pitch. That keeps the voice periodic and clean, unlike frequency-domain shifting.
+//
+// Formants (the size of the vocal tract) are moved independently by resampling each grain:
+// a grain played back `formant` times faster has its spectral envelope stretched by `formant`.
+// Unvoiced sounds (s, f, breaths) keep their timing and only get the formant change.
 #include "VFDSP.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define VF_PI 3.14159265358979323846f
-#define VF_OSAMP 8   // STFT overlap factor; higher = smoother, less "roughness"
+#define VF_PI 3.14159265358979323846
+#define VF_RING 16384               // power of two; holds input history and pending output
+#define VF_MASK (VF_RING - 1)
+#define VF_FMIN 75.0                // lowest speaking pitch tracked (Hz)
+#define VF_FMAX 500.0               // highest speaking pitch tracked (Hz)
+#define VF_FORMANT_MIN 0.7f         // bounds the grain length, and so the latency
+#define VF_FORMANT_MAX 2.5f
+#define VF_YIN_THRESHOLD 0.18f
 
 struct VFEngine {
     double sr;
-    int N, half, hop, latency, rover, cepCut;
-    int log2N;
+    int Tmin, Tmax;                 // period search range (samples)
+    int dec;                        // decimation used by the pitch detector
+    int lookahead, latency, detectHop;
+    double unvoicedT;               // grain spacing for unvoiced sound
 
-    float *win;
-    float *inFifo, *outFifo, *outAccum;
-    float *re, *im, *cre, *cim;
-    float *lastPhase, *anaMag, *anaPhase, *outRe, *outIm, *env;
-    float *prevSynPhase, *curSynPhase;   // synthesis phase of each analysis peak (prev/current frame)
-    unsigned char *prevIsPeak, *curIsPeak;
-    int *peaks;
-    float *twr, *twi;
-    int *bitrev;
+    float *in, *acc, *wsum;         // rings indexed by absolute sample time
+    float *scratch, *cmnd;          // pitch detector work buffers
+
+    int64_t now;                    // input samples written since reset
+    int64_t nextDetect;
+    double synPos;                  // next synthesis mark (input time)
+    double anaMark;                 // current analysis mark (input time)
+    double T;                       // current period (samples)
+    int voiced, voicedHold;
 
     VFParams cur, pending;
-    int dirty;
-    int active;
+    int dirty, active;
 
-    // low-shelf biquad
-    float b0, b1, b2, a1, a2, z1, z2;
+    float b0, b1, b2, a1, a2, z1, z2;   // low shelf
     float outGain;
-    float levelGain;   // smoothed loudness compensation
 };
 
 static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] = {
@@ -47,7 +55,7 @@ static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] 
     [VF_PRESET_DARK_LORD] = { "Dark Lord",     { 0.62f, 0.75f,  3.0f, 1.0f } },
     [VF_PRESET_TENOR]     = { "Tenor",         { 0.80f, 0.80f,  0.0f, 0.0f } },
     [VF_PRESET_NARRATOR]  = { "Deep Narrator", { 0.82f, 0.90f,  5.0f, 1.0f } },
-    [VF_PRESET_FEMALE]    = { "Female",        { 1.55f, 1.26f, -3.5f, 0.0f } },
+    [VF_PRESET_FEMALE]    = { "Female",        { 1.75f, 1.25f, -2.0f, 0.0f } },
     [VF_PRESET_SMURF]     = { "Smurf",         { 1.60f, 1.60f,  0.0f, 0.0f } },
     [VF_PRESET_CHIPMUNK]  = { "Chipmunk",      { 2.20f, 2.20f,  0.0f, 0.0f } },
     [VF_PRESET_CUSTOM]    = { "Custom",        { 1.00f, 1.00f,  0.0f, 0.0f } },
@@ -75,38 +83,11 @@ static int is_identity(VFParams p) {
            fabsf(p.bassDb) < 1e-3f && fabsf(p.gainDb) < 1e-3f;
 }
 
-// ---------------------------------------------------------------- FFT
-
-static void fft(VFEngine *e, float *re, float *im, int inverse) {
-    int N = e->N;
-    for (int i = 0; i < N; i++) {
-        int j = e->bitrev[i];
-        if (j > i) {
-            float t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-    }
-    for (int size = 2; size <= N; size <<= 1) {
-        int h = size >> 1, step = N / size;
-        for (int i = 0; i < N; i += size) {
-            for (int j = 0; j < h; j++) {
-                float wr = e->twr[j * step];
-                float wi = inverse ? e->twi[j * step] : -e->twi[j * step];
-                int a = i + j, b = a + h;
-                float tr = re[b] * wr - im[b] * wi;
-                float ti = re[b] * wi + im[b] * wr;
-                re[b] = re[a] - tr; im[b] = im[a] - ti;
-                re[a] += tr;        im[a] += ti;
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------- setup
 
 static void update_filter(VFEngine *e) {
     float A = powf(10.0f, e->cur.bassDb / 40.0f);
-    float w0 = 2.0f * VF_PI * 180.0f / (float)e->sr;
+    float w0 = 2.0f * (float)VF_PI * 180.0f / (float)e->sr;
     float cs = cosf(w0), alpha = sinf(w0) / 2.0f * sqrtf(2.0f);
     float sA = 2.0f * sqrtf(A) * alpha;
     float a0 = (A + 1) + (A - 1) * cs + sA;
@@ -123,56 +104,41 @@ VFEngine *vf_create(double sampleRate) {
     VFEngine *e = calloc(1, sizeof(VFEngine));
     if (!e) return NULL;
     e->sr = sampleRate;
-    // ~32 ms analysis window (largest power of two that fits), 256..2048 samples
-    int N = 256;
-    while (N * 2 <= sampleRate * 0.032 && N < 2048) N *= 2;
-    e->N = N; e->half = N / 2; e->hop = N / VF_OSAMP; e->latency = N - e->hop;
-    for (e->log2N = 0; (1 << e->log2N) < N; e->log2N++) {}
-    // cepstral lifter: keep quefrencies below ~1.6 ms (above the period of any speaking pitch)
-    e->cepCut = (int)(sampleRate * 0.0016);
-    if (e->cepCut < 8) e->cepCut = 8;
-    if (e->cepCut > e->half - 1) e->cepCut = e->half - 1;
+    e->Tmin = (int)floor(sampleRate / VF_FMAX);
+    e->Tmax = (int)ceil(sampleRate / VF_FMIN);
+    // the detector only needs speech pitch (< 500 Hz), so it runs at ~11-16 kHz whatever the rate
+    e->dec = (int)(sampleRate / 11000);
+    if (e->dec < 1) e->dec = 1;
+    e->detectHop = (int)(sampleRate * 0.005);           // re-estimate the pitch every 5 ms
+    e->unvoicedT = sampleRate * 0.008;                  // 8 ms grains for unvoiced sound
+    // Synthesis marks trail the input by enough to read a full grain and refine its mark;
+    // output trails them by the longest (formant-stretched) grain.
+    e->lookahead = (int)ceil(1.75 * e->Tmax) + 2;
+    e->latency = e->lookahead + (int)ceil(e->Tmax / VF_FORMANT_MIN) + 4;
 
-    size_t hn = (size_t)e->half + 1;
-    float **bufsN[] = { &e->win, &e->inFifo, &e->outFifo, &e->re, &e->im, &e->cre, &e->cim, &e->twr, &e->twi };
-    for (size_t i = 0; i < sizeof bufsN / sizeof *bufsN; i++)
-        if (!(*bufsN[i] = calloc(N, sizeof(float)))) goto fail;
-    if (!(e->outAccum = calloc(2 * N, sizeof(float)))) goto fail;
-    float **bufsH[] = { &e->lastPhase, &e->anaMag, &e->anaPhase, &e->outRe, &e->outIm, &e->env,
-                        &e->prevSynPhase, &e->curSynPhase };
-    for (size_t i = 0; i < sizeof bufsH / sizeof *bufsH; i++)
-        if (!(*bufsH[i] = calloc(hn, sizeof(float)))) goto fail;
-    if (!(e->prevIsPeak = calloc(hn, 1)) || !(e->curIsPeak = calloc(hn, 1))) goto fail;
-    if (!(e->peaks = calloc(hn, sizeof(int)))) goto fail;
-    if (!(e->bitrev = calloc(N, sizeof(int)))) goto fail;
-
-    for (int i = 0; i < N; i++) {
-        e->win[i] = 0.5f - 0.5f * cosf(2.0f * VF_PI * i / N);
-        e->twr[i] = cosf(2.0f * VF_PI * i / N);
-        e->twi[i] = sinf(2.0f * VF_PI * i / N);
-        int r = 0;
-        for (int b = 0; b < e->log2N; b++) if (i & (1 << b)) r |= 1 << (e->log2N - 1 - b);
-        e->bitrev[i] = r;
+    int detN = e->Tmax / e->dec * 2 + 2;
+    e->in = calloc(VF_RING, sizeof(float));
+    e->acc = calloc(VF_RING, sizeof(float));
+    e->wsum = calloc(VF_RING, sizeof(float));
+    e->scratch = calloc(detN, sizeof(float));
+    e->cmnd = calloc(detN, sizeof(float));
+    if (!e->in || !e->acc || !e->wsum || !e->scratch || !e->cmnd) {
+        vf_destroy(e);
+        return NULL;
     }
     e->cur = e->pending = kPresets[VF_PRESET_NORMAL].p;
     update_filter(e);
     vf_reset(e);
     return e;
-fail:
-    vf_destroy(e);
-    return NULL;
 }
 
 void vf_destroy(VFEngine *e) {
     if (!e) return;
-    float *all[] = { e->win, e->inFifo, e->outFifo, e->outAccum, e->re, e->im, e->cre, e->cim,
-                     e->lastPhase, e->anaMag, e->anaPhase, e->outRe, e->outIm, e->env,
-                     e->prevSynPhase, e->curSynPhase, e->twr, e->twi };
-    for (size_t i = 0; i < sizeof all / sizeof *all; i++) free(all[i]);
-    free(e->prevIsPeak);
-    free(e->curIsPeak);
-    free(e->peaks);
-    free(e->bitrev);
+    free(e->in);
+    free(e->acc);
+    free(e->wsum);
+    free(e->scratch);
+    free(e->cmnd);
     free(e);
 }
 
@@ -181,164 +147,132 @@ int vf_latency_samples(const VFEngine *e) { return e->latency; }
 
 void vf_set_params(VFEngine *e, VFParams p) {
     p.pitch = clampf(p.pitch, 0.25f, 4.0f);
-    p.formant = clampf(p.formant, 0.25f, 4.0f);
+    p.formant = clampf(p.formant, VF_FORMANT_MIN, VF_FORMANT_MAX);
     e->pending = p;
     e->dirty = 1;
 }
 
 void vf_reset(VFEngine *e) {
-    int N = e->N;
-    memset(e->inFifo, 0, N * sizeof(float));
-    memset(e->outFifo, 0, N * sizeof(float));
-    memset(e->outAccum, 0, 2 * N * sizeof(float));
-    memset(e->lastPhase, 0, (e->half + 1) * sizeof(float));
-    memset(e->prevSynPhase, 0, (e->half + 1) * sizeof(float));
-    memset(e->prevIsPeak, 0, e->half + 1);
-    e->levelGain = 1.0f;
-    e->rover = e->latency;
+    memset(e->in, 0, VF_RING * sizeof(float));
+    memset(e->acc, 0, VF_RING * sizeof(float));
+    memset(e->wsum, 0, VF_RING * sizeof(float));
+    e->now = 0;
+    e->nextDetect = 0;
+    e->synPos = 0;
+    e->anaMark = 0;
+    e->T = e->unvoicedT;
+    e->voiced = 0;
+    e->voicedHold = 0;
     e->z1 = e->z2 = 0;
 }
 
+// ---------------------------------------------------------------- pitch detection (YIN)
+
+// Returns the period in samples of the most recent audio, or 0 if it is not voiced.
+static double detect_period(VFEngine *e) {
+    int D = e->dec;
+    int tmax = e->Tmax / D, tmin = e->Tmin / D, W = tmax;
+    int N = W + tmax + 1;
+    int64_t start = e->now - (int64_t)N * D;
+    float energy = 0;
+    for (int i = 0; i < N; i++) {
+        float v = 0;
+        for (int k = 0; k < D; k++) v += e->in[(start + (int64_t)i * D + k) & VF_MASK];
+        v /= D;
+        e->scratch[i] = v;
+        energy += v * v;
+    }
+    if (energy / N < 1e-6f) return 0;   // silence (< -60 dBFS)
+
+    float run = 0;
+    e->cmnd[0] = 1;
+    for (int tau = 1; tau <= tmax; tau++) {
+        float sum = 0;
+        for (int j = 0; j < W; j++) {
+            float d = e->scratch[j] - e->scratch[j + tau];
+            sum += d * d;
+        }
+        run += sum;
+        e->cmnd[tau] = run > 0 ? sum * tau / run : 1;
+    }
+    int tau = -1;
+    for (int t = tmin; t <= tmax; t++) {
+        if (e->cmnd[t] < VF_YIN_THRESHOLD) {
+            while (t + 1 <= tmax && e->cmnd[t + 1] < e->cmnd[t]) t++;
+            tau = t;
+            break;
+        }
+    }
+    if (tau < 0) return 0;
+    double frac = 0;
+    if (tau > 1 && tau < tmax) {
+        float a = e->cmnd[tau - 1], b = e->cmnd[tau], c = e->cmnd[tau + 1];
+        float den = a - 2 * b + c;
+        if (fabsf(den) > 1e-9f) frac = 0.5 * (a - c) / den;
+    }
+    return (tau + frac) * D;
+}
+
+static void update_pitch(VFEngine *e) {
+    double T = detect_period(e);
+    if (T > 0) {
+        // avoid sudden octave jumps while a voiced segment continues
+        if (e->voiced) {
+            double r = T / e->T;
+            if (r > 1.8 && r < 2.2) T *= 0.5;
+            else if (r > 0.45 && r < 0.55) T *= 2.0;
+        }
+        e->T = e->voiced ? 0.6 * T + 0.4 * e->T : T;
+        e->voiced = 1;
+        e->voicedHold = 3;
+    } else if (e->voicedHold > 0) {
+        e->voicedHold--;                // bridge short detector dropouts inside a vowel
+    } else {
+        e->voiced = 0;
+        e->T = e->unvoicedT;
+    }
+}
+
+// ---------------------------------------------------------------- grains
+
+static inline float in_at(const VFEngine *e, double p) {
+    double fl = floor(p);
+    int64_t i = (int64_t)fl;
+    float f = (float)(p - fl);
+    return e->in[i & VF_MASK] * (1 - f) + e->in[(i + 1) & VF_MASK] * f;
+}
+
+// Move an analysis mark one period on, aligned to the previous grain by cross-correlation.
+static double next_mark(const VFEngine *e, double prev, double T) {
+    double cand = prev + T;
+    if (!e->voiced) return cand;
+    int half = (int)(T * 0.5), range = (int)(T / 6);
+    if (range < 1) return cand;
+    int64_t p0 = (int64_t)llround(prev), c0 = (int64_t)llround(cand);
+    double best = -1e30;
+    int bestS = 0;
+    for (int s = -range; s <= range; s++) {
+        double sum = 0;
+        for (int k = -half; k <= half; k++)
+            sum += e->in[(p0 + k) & VF_MASK] * e->in[(c0 + s + k) & VF_MASK];
+        if (sum > best) { best = sum; bestS = s; }
+    }
+    return (double)(c0 + bestS);
+}
+
+// Overlap-add one grain: source centred on analysis mark `a`, output centred on `c`.
+static void place_grain(VFEngine *e, double a, double c, double T, float formant) {
+    double h = T / formant;                 // output half-length
+    int64_t n0 = (int64_t)ceil(c - h), n1 = (int64_t)floor(c + h);
+    for (int64_t n = n0; n <= n1; n++) {
+        double k = n - c;
+        float w = (float)(0.5 + 0.5 * cos(VF_PI * k / h));
+        e->acc[n & VF_MASK] += w * in_at(e, a + k * formant);
+        e->wsum[n & VF_MASK] += w;
+    }
+}
+
 // ---------------------------------------------------------------- processing
-
-// Smoothed spectral envelope (linear magnitude) from anaMag via real cepstrum.
-static void compute_envelope(VFEngine *e) {
-    int N = e->N, half = e->half, cut = e->cepCut;
-    for (int k = 0; k <= half; k++) {
-        e->cre[k] = logf(e->anaMag[k] + 1e-9f);
-        e->cim[k] = 0;
-    }
-    for (int k = half + 1; k < N; k++) { e->cre[k] = e->cre[N - k]; e->cim[k] = 0; }
-    fft(e, e->cre, e->cim, 1);
-    // lifter (cepstrum of a real even sequence is real and even)
-    for (int n = 0; n < N; n++) {
-        float w = (n < cut || n > N - cut) ? 1.0f / N : 0.0f;
-        e->cre[n] *= w;
-        e->cim[n] = 0;
-    }
-    fft(e, e->cre, e->cim, 0);
-    for (int k = 0; k <= half; k++) e->env[k] = expf(e->cre[k]);
-}
-
-static float env_at(const VFEngine *e, float pos) {
-    if (pos <= 0) return e->env[0];
-    if (pos >= e->half) return e->env[e->half];
-    int i = (int)pos;
-    float f = pos - i;
-    return e->env[i] * (1 - f) + e->env[i + 1] * f;
-}
-
-static void process_frame(VFEngine *e) {
-    int N = e->N, half = e->half;
-    float expct = 2.0f * VF_PI * e->hop / N;
-    float pitch = e->cur.pitch, formant = e->cur.formant;
-    int separate = fabsf(pitch - formant) > 1e-3f;
-
-    // zero-phase windowing: rotate the frame so its centre is at index 0, which makes
-    // bin phases independent of the bin index (peaks can then move between bins freely)
-    for (int k = 0; k < N; k++) {
-        int n = (k + half) & (N - 1);
-        e->re[k] = e->inFifo[n] * e->win[n];
-        e->im[k] = 0;
-    }
-    fft(e, e->re, e->im, 0);
-
-    float maxMag = 0;
-    for (int k = 0; k <= half; k++) {
-        float re = e->re[k], im = e->im[k];
-        e->anaMag[k] = sqrtf(re * re + im * im);
-        e->anaPhase[k] = atan2f(im, re);
-        if (e->anaMag[k] > maxMag) maxMag = e->anaMag[k];
-    }
-
-    if (separate) compute_envelope(e);
-
-    // find spectral peaks
-    int np = 0;
-    float floorMag = maxMag * 1e-4f;
-    memset(e->curIsPeak, 0, half + 1);
-    for (int k = 1; k < half; k++) {
-        float m = e->anaMag[k];
-        if (m > floorMag && m > e->anaMag[k - 1] && m >= e->anaMag[k + 1]) {
-            e->peaks[np++] = k;
-            e->curIsPeak[k] = 1;
-        }
-    }
-
-    memset(e->outRe, 0, (half + 1) * sizeof(float));
-    memset(e->outIm, 0, (half + 1) * sizeof(float));
-    int regionStart = 0;
-    for (int p = 0; p < np; p++) {
-        int kp = e->peaks[p];
-        // region of influence: up to the magnitude minimum before the next peak
-        int regionEnd = half;
-        if (p + 1 < np) {
-            regionEnd = kp;
-            for (int k = kp + 1; k < e->peaks[p + 1]; k++)
-                if (e->anaMag[k] < e->anaMag[regionEnd]) regionEnd = k;
-        }
-
-        // true frequency of the peak (in bins) from the phase advance since the last frame
-        float d = e->anaPhase[kp] - e->lastPhase[kp] - kp * expct;
-        d -= 2.0f * VF_PI * floorf(d / (2.0f * VF_PI) + 0.5f);
-        float fTrue = kp + VF_OSAMP * d / (2.0f * VF_PI);
-        float fNew = fTrue * pitch;
-        int shift = (int)floorf(fNew + 0.5f) - kp;
-
-        // continue the synthesis phase of the matching peak from the previous frame
-        int match = -1;
-        for (int o = 0; o <= 2 && match < 0; o++) {
-            if (kp - o >= 0 && e->prevIsPeak[kp - o]) match = kp - o;
-            else if (kp + o <= half && e->prevIsPeak[kp + o]) match = kp + o;
-        }
-        float synPhase = match >= 0 ? e->prevSynPhase[match] + fNew * expct
-                                    : e->anaPhase[kp] * pitch;
-        synPhase = fmodf(synPhase, 2.0f * VF_PI);
-        e->curSynPhase[kp] = synPhase;
-        float rot = synPhase - e->anaPhase[kp];
-
-        for (int k = regionStart; k <= regionEnd; k++) {
-            int j = k + shift;
-            if (j < 0 || j > half) continue;
-            float m = e->anaMag[k];
-            if (separate) m *= env_at(e, j / formant) / (e->env[k] + 1e-9f);
-            float ph = e->anaPhase[k] + rot;
-            e->outRe[j] += m * cosf(ph);
-            e->outIm[j] += m * sinf(ph);
-        }
-        regionStart = regionEnd + 1;
-    }
-    memcpy(e->lastPhase, e->anaPhase, (half + 1) * sizeof(float));
-    memcpy(e->prevSynPhase, e->curSynPhase, (half + 1) * sizeof(float));
-    memcpy(e->prevIsPeak, e->curIsPeak, half + 1);
-
-    // keep loudness equal to the input: shifting changes how many harmonics fall
-    // under the formants, so match frame energy with a smoothed gain
-    float eIn = 0, eOut = 0;
-    for (int k = 0; k <= half; k++) {
-        eIn += e->anaMag[k] * e->anaMag[k];
-        eOut += e->outRe[k] * e->outRe[k] + e->outIm[k] * e->outIm[k];
-    }
-    if (eOut > 1e-12f && eIn > 1e-12f) {
-        float target = clampf(sqrtf(eIn / eOut), 0.25f, 4.0f);
-        e->levelGain += (target - e->levelGain) * 0.15f;
-    }
-
-    // synthesis
-    for (int k = 0; k <= half; k++) { e->re[k] = e->outRe[k] * e->levelGain; e->im[k] = e->outIm[k] * e->levelGain; }
-    e->im[0] = e->im[half] = 0;
-    for (int k = half + 1; k < N; k++) { e->re[k] = e->re[N - k]; e->im[k] = -e->im[N - k]; }
-    fft(e, e->re, e->im, 1);
-
-    // overlap-add: periodic Hann analysis*synthesis at 4x overlap sums to 1.5
-    // Hann analysis*synthesis at this overlap sums to N * OSAMP * mean(Hann^2), mean(Hann^2)=0.375
-    float scale = 1.0f / (N * VF_OSAMP * 0.375f);
-    for (int k = 0; k < N; k++) e->outAccum[k] += e->re[(k + half) & (N - 1)] * e->win[k] * scale;
-    memcpy(e->outFifo, e->outAccum, e->hop * sizeof(float));
-    memmove(e->outAccum, e->outAccum + e->hop, N * sizeof(float));
-    memset(e->outAccum + N, 0, e->hop * sizeof(float));
-    memmove(e->inFifo, e->inFifo + e->hop, e->latency * sizeof(float));
-}
 
 static inline float soft_limit(float x) {
     float a = fabsf(x);
@@ -347,9 +281,34 @@ static inline float soft_limit(float x) {
     return x < 0 ? -y : y;
 }
 
+static float process_sample(VFEngine *e, float x) {
+    e->in[e->now & VF_MASK] = x;
+    e->now++;
+    if (e->now >= e->nextDetect) {
+        update_pitch(e);
+        e->nextDetect = e->now + e->detectHop;
+    }
+
+    float pitch = e->cur.pitch, formant = e->cur.formant;
+    while (e->synPos + e->lookahead <= (double)e->now) {
+        double T = e->T;
+        // analysis mark nearest the synthesis mark (time is preserved)
+        while (e->anaMark + T * 0.5 < e->synPos) e->anaMark = next_mark(e, e->anaMark, T);
+        place_grain(e, e->anaMark, e->synPos, T, formant);
+        e->synPos += e->voiced ? T / pitch : T;
+    }
+
+    int64_t r = e->now - 1 - e->latency;
+    float *acc = &e->acc[r & VF_MASK], *ws = &e->wsum[r & VF_MASK];
+    float y = *ws > 0.35f ? *acc / *ws : *acc / 0.35f;
+    *acc = 0;
+    *ws = 0;
+    return y;
+}
+
 void vf_process(VFEngine *e, float *buf, int n) {
     for (int i = 0; i < n; i++) {
-        if (e->rover == e->latency && e->dirty) {
+        if (e->dirty) {
             int wasActive = e->active;
             e->cur = e->pending;
             e->dirty = 0;
@@ -359,12 +318,7 @@ void vf_process(VFEngine *e, float *buf, int n) {
         }
         if (!e->active) continue;
 
-        e->inFifo[e->rover] = buf[i];
-        float y = e->outFifo[e->rover - e->latency];
-        if (++e->rover >= e->N) {
-            e->rover = e->latency;
-            process_frame(e);
-        }
+        float y = process_sample(e, buf[i]);
         // low shelf (transposed direct form II)
         float s = e->b0 * y + e->z1;
         e->z1 = e->b1 * y - e->a1 * s + e->z2;
