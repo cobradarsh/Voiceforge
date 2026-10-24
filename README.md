@@ -40,6 +40,14 @@ With Theos installed locally: `make package FINALPACKAGE=1` (roothide by default
 3. Settings → VoiceForge → pick a **Voice**. It applies to your microphone while a call is active
    and can be changed mid-call.
 
+### In-call button
+
+During a call, a waveform button sits on the right of the call screen (drag it anywhere; it
+turns green while a voice is active). Tap it for the voice menu: Off, Female, Narrator,
+Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom** opens the pitch grid
+(0.7 · 0.8 · 0.9 | 1.1 … 2.0) for fine-tuning; formants follow the pitch automatically
+(formant = pitch^0.33). Turn the button off with Settings → VoiceForge → In-call button.
+
 ## Finding the call audio path (first-time setup)
 
 Apple doesn't document which audio unit carries the uplink (your voice) during a cellular call,

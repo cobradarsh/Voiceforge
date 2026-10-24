@@ -1,11 +1,13 @@
 // VoiceForge — live voice changer for calls.
 //
-// One dylib, two roles:
+// One dylib, three roles:
 //   SpringBoard          reads the Settings pane, watches calls (CallKit) and publishes a
-//                        64-bit state word + a target word through notify(3).
+//                        64-bit state word + a target word through notify(3); saves voices
+//                        picked from the in-call menu.
 //   audiomxd/mediaserverd hooks the public AudioToolbox render/process entry points and runs
 //                        the VFDSP engine on the microphone stream while a call is active.
-#import <Foundation/Foundation.h>
+//   InCallService        draws the in-call button and voice menu.
+#import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CallKit/CallKit.h>
 #import <notify.h>
@@ -18,6 +20,7 @@
 #define VF_PREFS_CHANGED  "com.voiceforge/prefs"
 #define VF_STATE_NAME     "com.voiceforge.state"
 #define VF_TARGET_NAME    "com.voiceforge.target"
+#define VF_SELECT_NAME    "com.voiceforge.select"   // in-call menu -> SpringBoard
 
 // state word
 #define VF_ST_PRESET(s)   ((int)((s) & 0xff))
@@ -25,6 +28,7 @@
 #define VF_ST_INCALL      (1ULL << 9)
 #define VF_ST_DEBUG       (1ULL << 10)
 #define VF_ST_ALWAYS      (1ULL << 11)
+#define VF_ST_BUTTON      (1ULL << 12)   // show the in-call button
 #define VF_ST_PITCH(s)    ((float)(((s) >> 16) & 0xff) / 100.0f)
 #define VF_ST_FORMANT(s)  ((float)(((s) >> 24) & 0xff) / 100.0f)
 
@@ -88,6 +92,7 @@ static void vf_publish(void) {
     if (sInCall) s |= VF_ST_INCALL;
     if (vf_pref_bool(@"debugLog", NO)) s |= VF_ST_DEBUG;
     if (vf_pref_bool(@"alwaysOn", NO)) s |= VF_ST_ALWAYS;
+    if (vf_pref_bool(@"inCallButton", YES)) s |= VF_ST_BUTTON;
     uint64_t pitch = (uint64_t)lround(fmin(fmax(vf_pref_double(@"customPitch", 1.3), 0.5), 2.5) * 100);
     uint64_t formant = (uint64_t)lround(fmin(fmax(vf_pref_double(@"customFormant", 1.1), 0.5), 2.5) * 100);
     s |= pitch << 16 | formant << 24;
@@ -132,11 +137,35 @@ static void vf_prefs_changed(CFNotificationCenterRef c, void *o, CFStringRef n, 
     vf_publish();
 }
 
+// selection word from the in-call menu: [0..7] preset, bit 8 valid, bit 9 has pitch,
+// [16..23] custom pitch x100, [24..31] custom formant x100
+#define VF_SEL_VALID      (1ULL << 8)
+#define VF_SEL_HAS_PITCH  (1ULL << 9)
+static int sSBSelectToken = -1;
+
+static void vf_select_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
+    uint64_t sel = 0;
+    if (notify_get_state(sSBSelectToken, &sel) != NOTIFY_STATUS_OK || !(sel & VF_SEL_VALID)) return;
+    int preset = VF_ST_PRESET(sel);
+    if (preset >= VF_PRESET_COUNT) return;
+    CFPreferencesSetAppValue(CFSTR("preset"), (__bridge CFNumberRef)@(preset), VF_PREFS_DOMAIN);
+    CFPreferencesSetAppValue(CFSTR("enabled"), kCFBooleanTrue, VF_PREFS_DOMAIN);
+    if (sel & VF_SEL_HAS_PITCH) {
+        CFPreferencesSetAppValue(CFSTR("customPitch"), (__bridge CFNumberRef)@(VF_ST_PITCH(sel)), VF_PREFS_DOMAIN);
+        CFPreferencesSetAppValue(CFSTR("customFormant"), (__bridge CFNumberRef)@(VF_ST_FORMANT(sel)), VF_PREFS_DOMAIN);
+    }
+    CFPreferencesAppSynchronize(VF_PREFS_DOMAIN);
+    vf_publish();
+}
+
 static void vf_springboard_init(void) {
     notify_register_check(VF_STATE_NAME, &sSBStateToken);
     notify_register_check(VF_TARGET_NAME, &sSBTargetToken);
+    notify_register_check(VF_SELECT_NAME, &sSBSelectToken);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_prefs_changed,
                                     CFSTR(VF_PREFS_CHANGED), NULL, CFNotificationSuspensionBehaviorCoalesce);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_select_changed,
+                                    CFSTR(VF_SELECT_NAME), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
     dispatch_async(dispatch_get_main_queue(), ^{
         sCallWatcher = [VFCallWatcher new];
     });
@@ -405,12 +434,376 @@ static void vf_audio_init(void) {
     VFLog("loaded into %{public}s, state=0x%llx target=0x%llx", getprogname(), sState, sTarget);
 }
 
+// =====================================================================================
+// In-call screen (InCallService): floating button + voice menu
+// =====================================================================================
+
+static int sICStateToken = -1, sICSelectToken = -1;
+
+static const int kMenuPresets[] = { VF_PRESET_NORMAL, VF_PRESET_FEMALE, VF_PRESET_NARRATOR, VF_PRESET_DARK_LORD,
+                                    VF_PRESET_TENOR, VF_PRESET_SMURF, VF_PRESET_CHIPMUNK, VF_PRESET_CUSTOM };
+static NSString *const kMenuTitles[] = { @"Off", @"Female", @"Narrator", @"Dark Lord",
+                                         @"Tenor", @"Smurf", @"Chipmunk", @"Custom" };
+static const int kMenuCount = 8;
+static const int kLowPitches[] = { 70, 80, 90 };
+static const int kHighPitches[] = { 110, 120, 130, 140, 150, 160, 170, 180, 190, 200 };
+
+static uint64_t vf_ic_state(void) {
+    uint64_t s = 0;
+    if (sICStateToken >= 0) notify_get_state(sICStateToken, &s);
+    return s;
+}
+
+// Custom pitch from the menu: formants follow at a cube-root rate, which keeps the voice
+// natural (pitch 1.7 -> formant 1.19, close to the Female preset; 0.8 -> 0.93).
+static void vf_ic_select(int preset, int pitchX100) {
+    uint64_t sel = (uint64_t)preset | VF_SEL_VALID;
+    if (pitchX100 > 0) {
+        float pitch = pitchX100 / 100.0f;
+        uint64_t formant = (uint64_t)lroundf(powf(pitch, 0.33f) * 100);
+        sel |= VF_SEL_HAS_PITCH | (uint64_t)pitchX100 << 16 | formant << 24;
+    }
+    notify_set_state(sICSelectToken, sel);
+    notify_post(VF_SELECT_NAME);
+}
+
+@interface VFInCallUI : NSObject
++ (instancetype)shared;
+- (void)attachTo:(UIView *)host;
+- (void)stateChanged;
+@end
+
+@implementation VFInCallUI {
+    __weak UIView *_host;
+    UIButton *_button;
+    UIControl *_backdrop;
+    UIVisualEffectView *_panel;
+    UILabel *_subtitle;
+    NSMutableArray<UIButton *> *_presetButtons;
+    NSMutableArray<UIButton *> *_pitchButtons;
+    BOOL _customOpen;
+    int _shownPreset;
+    int _shownPitch;   // x100
+    BOOL _enabled;
+}
+
++ (instancetype)shared {
+    static VFInCallUI *ui;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ui = [VFInCallUI new]; });
+    return ui;
+}
+
+- (instancetype)init {
+    if ((self = [super init])) {
+        _presetButtons = [NSMutableArray array];
+        _pitchButtons = [NSMutableArray array];
+        [self readState];
+    }
+    return self;
+}
+
+- (void)readState {
+    uint64_t st = vf_ic_state();
+    _shownPreset = VF_ST_PRESET(st);
+    _shownPitch = (int)lroundf(VF_ST_PITCH(st) * 100);
+    _enabled = (st & VF_ST_ENABLED) != 0;
+}
+
+- (void)stateChanged {
+    [self readState];
+    if (!(vf_ic_state() & VF_ST_BUTTON)) {
+        [self detach];
+        return;
+    }
+    [self refresh];
+}
+
+// ------------------------------------------------------------------ button
+
+- (UIButton *)makeButton {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(0, 0, 56, 56);
+    b.layer.cornerRadius = 16;
+    b.clipsToBounds = YES;
+    UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
+    bg.frame = b.bounds;
+    bg.userInteractionEnabled = NO;
+    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [b insertSubview:bg atIndex:0];
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightSemibold];
+    [b setImage:[UIImage systemImageNamed:@"waveform" withConfiguration:cfg] forState:UIControlStateNormal];
+    [b addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
+    [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+    b.accessibilityLabel = @"Voice changer";
+    return b;
+}
+
+- (CGPoint)clamp:(CGPoint)p {
+    UIView *host = _host;
+    UIEdgeInsets s = host.safeAreaInsets;
+    CGFloat r = 28 + 8;
+    p.x = fmax(r, fmin(host.bounds.size.width - r, p.x));
+    p.y = fmax(s.top + r, fmin(host.bounds.size.height - s.bottom - r, p.y));
+    return p;
+}
+
+- (void)drag:(UIPanGestureRecognizer *)g {
+    UIView *host = _host;
+    if (!host) return;
+    CGPoint t = [g translationInView:host];
+    _button.center = CGPointMake(_button.center.x + t.x, _button.center.y + t.y);
+    [g setTranslation:CGPointZero inView:host];
+    if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
+        _button.center = [self clamp:_button.center];
+        [NSUserDefaults.standardUserDefaults setObject:NSStringFromCGPoint(_button.center) forKey:@"VoiceForgeButtonCenter"];
+    }
+}
+
+- (void)attachTo:(UIView *)host {
+    [self readState];
+    if (!(vf_ic_state() & VF_ST_BUTTON)) {
+        [self detach];
+        return;
+    }
+    if (_host == host && _button.superview == host) {
+        [host bringSubviewToFront:_button];
+        [self refresh];
+        return;
+    }
+    [self closeMenu];
+    _host = host;
+    if (!_button) _button = [self makeButton];
+    [host addSubview:_button];
+    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"VoiceForgeButtonCenter"];
+    CGPoint c = saved ? CGPointFromString(saved)
+                      : CGPointMake(host.bounds.size.width - 36, host.safeAreaInsets.top + 115);
+    _button.center = [self clamp:c];
+    [self refresh];
+}
+
+- (void)detach {
+    [self closeMenu];
+    [_button removeFromSuperview];
+    _host = nil;
+}
+
+// ------------------------------------------------------------------ menu
+
+- (void)toggleMenu {
+    if (_panel) [self closeMenu];
+    else [self openMenu];
+}
+
+- (void)openMenu {
+    UIView *host = _host;
+    if (!host) return;
+    [self readState];
+    _customOpen = _shownPreset == VF_PRESET_CUSTOM;
+
+    _backdrop = [[UIControl alloc] initWithFrame:host.bounds];
+    _backdrop.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _backdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.25];
+    [_backdrop addTarget:self action:@selector(closeMenu) forControlEvents:UIControlEventTouchUpInside];
+    [host addSubview:_backdrop];
+
+    _panel = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterialDark]];
+    _panel.layer.cornerRadius = 24;
+    _panel.clipsToBounds = YES;
+    [host addSubview:_panel];
+    [self buildPanel];
+
+    _backdrop.alpha = 0;
+    _panel.alpha = 0;
+    _panel.transform = CGAffineTransformMakeScale(0.92, 0.92);
+    [UIView animateWithDuration:0.22 animations:^{
+        self->_backdrop.alpha = 1;
+        self->_panel.alpha = 1;
+        self->_panel.transform = CGAffineTransformIdentity;
+    }];
+}
+
+- (void)closeMenu {
+    UIView *panel = _panel, *backdrop = _backdrop;
+    _panel = nil;
+    _backdrop = nil;
+    _subtitle = nil;
+    [_presetButtons removeAllObjects];
+    [_pitchButtons removeAllObjects];
+    if (!panel) return;
+    [UIView animateWithDuration:0.18 animations:^{
+        panel.alpha = 0;
+        backdrop.alpha = 0;
+    } completion:^(BOOL finished) {
+        [panel removeFromSuperview];
+        [backdrop removeFromSuperview];
+    }];
+}
+
+- (UILabel *)labelWithFrame:(CGRect)frame text:(NSString *)text size:(CGFloat)size alpha:(CGFloat)alpha {
+    UILabel *l = [[UILabel alloc] initWithFrame:frame];
+    l.text = text;
+    l.font = [UIFont systemFontOfSize:size weight:UIFontWeightSemibold];
+    l.textColor = [UIColor colorWithWhite:1 alpha:alpha];
+    return l;
+}
+
+- (UIButton *)chipWithFrame:(CGRect)frame title:(NSString *)title tag:(NSInteger)tag action:(SEL)action {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = frame;
+    b.tag = tag;
+    b.layer.cornerRadius = frame.size.height / 2;
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    b.titleLabel.minimumScaleFactor = 0.7;
+    [b setTitle:title forState:UIControlStateNormal];
+    [b addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)layoutPitchRow:(const int *)values count:(int)n y:(CGFloat)y width:(CGFloat)W diameter:(CGFloat)d gap:(CGFloat)gap in:(UIView *)c {
+    CGFloat rowW = n * d + (n - 1) * gap, x = (W - rowW) / 2;
+    for (int i = 0; i < n; i++) {
+        NSString *t = [NSString stringWithFormat:@"%.1f", values[i] / 100.0];
+        UIButton *b = [self chipWithFrame:CGRectMake(x + i * (d + gap), y, d, d) title:t tag:values[i] action:@selector(pitchTapped:)];
+        [c addSubview:b];
+        [_pitchButtons addObject:b];
+    }
+}
+
+- (void)buildPanel {
+    UIView *host = _host;
+    UIView *c = _panel.contentView;
+    for (UIView *v in [c.subviews copy]) [v removeFromSuperview];
+    [_presetButtons removeAllObjects];
+    [_pitchButtons removeAllObjects];
+
+    CGFloat W = fmin(host.bounds.size.width - 32, 420), pad = 16, gap = 8, y = 16;
+    [c addSubview:[self labelWithFrame:CGRectMake(pad, y, W - 2 * pad, 18) text:@"Voice changer" size:14 alpha:0.6]];
+    y += 20;
+    _subtitle = [self labelWithFrame:CGRectMake(pad, y, W - 2 * pad, 22) text:@"" size:17 alpha:0.95];
+    [c addSubview:_subtitle];
+    y += 22 + 14;
+
+    CGFloat cw = (W - 2 * pad - 3 * gap) / 4, ch = 42;
+    for (int i = 0; i < kMenuCount; i++) {
+        CGRect f = CGRectMake(pad + (i % 4) * (cw + gap), y + (i / 4) * (ch + gap), cw, ch);
+        UIButton *b = [self chipWithFrame:f title:kMenuTitles[i] tag:kMenuPresets[i] action:@selector(presetTapped:)];
+        [c addSubview:b];
+        [_presetButtons addObject:b];
+    }
+    y += 2 * ch + gap;
+
+    if (_customOpen) {
+        y += 18;
+        [c addSubview:[self labelWithFrame:CGRectMake(pad, y, W - 2 * pad, 16) text:@"Custom pitch" size:13 alpha:0.6]];
+        y += 24;
+        CGFloat d = fmin(52, (W - 2 * pad - 4 * gap) / 5);
+        [self layoutPitchRow:kLowPitches count:3 y:y width:W diameter:d gap:gap in:c];
+        y += d + 14;
+        UIView *line = [[UIView alloc] initWithFrame:CGRectMake(pad + 12, y, W - 2 * pad - 24, 1)];
+        line.backgroundColor = [UIColor colorWithWhite:1 alpha:0.5];
+        [c addSubview:line];
+        y += 15;
+        [self layoutPitchRow:kHighPitches count:5 y:y width:W diameter:d gap:gap in:c];
+        y += d + gap;
+        [self layoutPitchRow:kHighPitches + 5 count:5 y:y width:W diameter:d gap:gap in:c];
+        y += d;
+    }
+    y += pad + 4;
+
+    CGFloat top = fmax(host.safeAreaInsets.top + 60, (host.bounds.size.height - y) / 2 - 40);
+    _panel.frame = CGRectMake((host.bounds.size.width - W) / 2, top, W, y);
+    [self refresh];
+}
+
+- (void)styleChip:(UIButton *)b selected:(BOOL)selected {
+    b.backgroundColor = selected ? [UIColor colorWithWhite:1 alpha:0.92] : [UIColor colorWithWhite:1 alpha:0.12];
+    [b setTitleColor:selected ? UIColor.blackColor : UIColor.whiteColor forState:UIControlStateNormal];
+}
+
+- (void)refresh {
+    BOOL active = _enabled && _shownPreset != VF_PRESET_NORMAL;
+    _button.tintColor = active ? UIColor.systemGreenColor : UIColor.whiteColor;
+    for (UIButton *b in _presetButtons) [self styleChip:b selected:b.tag == _shownPreset];
+    for (UIButton *b in _pitchButtons)
+        [self styleChip:b selected:_shownPreset == VF_PRESET_CUSTOM && labs((long)b.tag - _shownPitch) <= 1];
+    NSString *name = [NSString stringWithUTF8String:vf_preset_name((VFPreset)_shownPreset)];
+    if (!_enabled) name = @"Off (disabled in Settings)";
+    else if (_shownPreset == VF_PRESET_CUSTOM) name = [NSString stringWithFormat:@"Custom · pitch %.2f", _shownPitch / 100.0];
+    _subtitle.text = name;
+}
+
+- (void)presetTapped:(UIButton *)b {
+    int preset = (int)b.tag;
+    _enabled = YES;
+    _shownPreset = preset;
+    if (preset == VF_PRESET_CUSTOM) {
+        if (_shownPitch < 50) _shownPitch = 130;
+        vf_ic_select(preset, _shownPitch);
+        _customOpen = YES;
+        [self buildPanel];
+        return;
+    }
+    vf_ic_select(preset, 0);
+    if (_customOpen) {
+        _customOpen = NO;
+        [self buildPanel];
+    } else {
+        [self refresh];
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self closeMenu];
+    });
+}
+
+- (void)pitchTapped:(UIButton *)b {
+    _enabled = YES;
+    _shownPreset = VF_PRESET_CUSTOM;
+    _shownPitch = (int)b.tag;
+    vf_ic_select(VF_PRESET_CUSTOM, _shownPitch);
+    [self refresh];
+}
+
+@end
+
+static void vf_ic_state_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[VFInCallUI shared] stateChanged];
+    });
+}
+
+%group VFInCall
+
+%hook UIViewController
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+    NSString *cls = NSStringFromClass(self.class);
+    if (vf_ic_state() & VF_ST_DEBUG) VFLog("InCallService view controller appeared: %{public}@", cls);
+    // PHAudioCallViewController is the voice-call screen (name matched loosely across iOS versions)
+    if ([cls containsString:@"AudioCallViewController"]) [[VFInCallUI shared] attachTo:self.view];
+}
+%end
+
+%end
+
+static void vf_incall_init(void) {
+    notify_register_check(VF_STATE_NAME, &sICStateToken);
+    notify_register_check(VF_SELECT_NAME, &sICSelectToken);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_ic_state_changed,
+                                    CFSTR(VF_STATE_NAME), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+}
+
 %ctor {
     const char *name = getprogname();
+    NSString *bundleID = NSBundle.mainBundle.bundleIdentifier;
     if (!strcmp(name, "audiomxd") || !strcmp(name, "mediaserverd")) {
         vf_audio_init();
         %init(VFAudio);
-    } else if ([NSBundle.mainBundle.bundleIdentifier isEqualToString:@"com.apple.springboard"]) {
+    } else if ([bundleID isEqualToString:@"com.apple.springboard"]) {
         vf_springboard_init();
+    } else if ([bundleID isEqualToString:@"com.apple.InCallService"]) {
+        vf_incall_init();
+        %init(VFInCall);
     }
 }
