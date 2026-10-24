@@ -1,5 +1,6 @@
 #!/bin/sh
-# restart the audio servers so they load (or unload) the hooks
+# restart the audio servers and the call screen so they load (or unload) the hooks
 killall -9 audiomxd 2>/dev/null
 killall -9 mediaserverd 2>/dev/null
+killall -9 InCallService 2>/dev/null
 exit 0

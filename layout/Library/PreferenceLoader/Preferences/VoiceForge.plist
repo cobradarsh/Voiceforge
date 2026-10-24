@@ -19,7 +19,7 @@
 			<key>label</key>
 			<string>Voice</string>
 			<key>footerText</key>
-			<string>The voice is applied to your microphone during calls. Change it here or with the waveform button on the call screen (drag it to move it). In the in-call menu, Custom shows pitch values from 0.7 to 2.0; formants follow automatically.</string>
+			<string>The voice is applied to your microphone during calls. Change it here or with the purple VoiceForge button on the call screen (drag it to move it). In the in-call menu, Custom shows pitch values from 0.7 to 2.0; formants follow automatically.</string>
 		</dict>
 		<dict>
 			<key>cell</key>

@@ -42,11 +42,14 @@ With Theos installed locally: `make package FINALPACKAGE=1` (roothide by default
 
 ### In-call button
 
-During a call, a waveform button sits on the right of the call screen (drag it anywhere; it
-turns green while a voice is active). Tap it for the voice menu: Off, Female, Narrator,
-Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom** opens the pitch grid
-(0.7 · 0.8 · 0.9 | 1.1 … 2.0) for fine-tuning; formants follow the pitch automatically
-(formant = pitch^0.33). Turn the button off with Settings → VoiceForge → In-call button.
+During a call, a pill-shaped **VoiceForge** button sits on the right of the call screen showing
+the current voice ("Voice" when off; purple while a voice is active). Drag it anywhere. Tap it for
+the voice menu: Off, Female, Narrator, Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom**
+opens the pitch grid (0.7 · 0.8 · 0.9 | 1.1 … 2.0) for fine-tuning; formants follow the pitch
+automatically (formant = pitch^0.33). Turn the button off with Settings → VoiceForge → In-call button.
+
+If another voice-changer tweak is installed, its own in-call button and menu are separate from
+VoiceForge's; uninstall it to avoid two tweaks changing the call audio.
 
 ## Finding the call audio path (first-time setup)
 

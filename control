@@ -1,6 +1,6 @@
 Package: com.voiceforge.tweak
 Name: VoiceForge
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64e
 Description: Live voice changer for phone calls, with pitch and formant presets (Female, Deep Narrator, Dark Lord, Chipmunk, Custom).
 Maintainer: VoiceForge

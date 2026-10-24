@@ -20,7 +20,7 @@
 #define VF_PREFS_CHANGED  "com.voiceforge/prefs"
 #define VF_STATE_NAME     "com.voiceforge.state"
 #define VF_TARGET_NAME    "com.voiceforge.target"
-#define VF_SELECT_NAME    "com.voiceforge.select"   // in-call menu -> SpringBoard
+#define VF_SELECT_PREFIX  "com.voiceforge.select."  // in-call menu -> SpringBoard ("preset.N" / "pitch.N")
 
 // state word
 #define VF_ST_PRESET(s)   ((int)((s) & 0xff))
@@ -28,7 +28,7 @@
 #define VF_ST_INCALL      (1ULL << 9)
 #define VF_ST_DEBUG       (1ULL << 10)
 #define VF_ST_ALWAYS      (1ULL << 11)
-#define VF_ST_BUTTON      (1ULL << 12)   // show the in-call button
+#define VF_ST_HIDE_BUTTON (1ULL << 12)   // hide the in-call button (unset = shown, so a failed read still shows it)
 #define VF_ST_PITCH(s)    ((float)(((s) >> 16) & 0xff) / 100.0f)
 #define VF_ST_FORMANT(s)  ((float)(((s) >> 24) & 0xff) / 100.0f)
 
@@ -92,7 +92,7 @@ static void vf_publish(void) {
     if (sInCall) s |= VF_ST_INCALL;
     if (vf_pref_bool(@"debugLog", NO)) s |= VF_ST_DEBUG;
     if (vf_pref_bool(@"alwaysOn", NO)) s |= VF_ST_ALWAYS;
-    if (vf_pref_bool(@"inCallButton", YES)) s |= VF_ST_BUTTON;
+    if (!vf_pref_bool(@"inCallButton", YES)) s |= VF_ST_HIDE_BUTTON;
     uint64_t pitch = (uint64_t)lround(fmin(fmax(vf_pref_double(@"customPitch", 1.3), 0.5), 2.5) * 100);
     uint64_t formant = (uint64_t)lround(fmin(fmax(vf_pref_double(@"customFormant", 1.1), 0.5), 2.5) * 100);
     s |= pitch << 16 | formant << 24;
@@ -137,35 +137,48 @@ static void vf_prefs_changed(CFNotificationCenterRef c, void *o, CFStringRef n, 
     vf_publish();
 }
 
-// selection word from the in-call menu: [0..7] preset, bit 8 valid, bit 9 has pitch,
-// [16..23] custom pitch x100, [24..31] custom formant x100
-#define VF_SEL_VALID      (1ULL << 8)
-#define VF_SEL_HAS_PITCH  (1ULL << 9)
-static int sSBSelectToken = -1;
+// The in-call menu posts one Darwin notification per choice ("preset.N" or "pitch.N", pitch x100),
+// so the sandboxed call screen only needs notify_post and no shared state.
+static const int kSelectPitches[] = { 70, 80, 90, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200 };
 
 static void vf_select_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
-    uint64_t sel = 0;
-    if (notify_get_state(sSBSelectToken, &sel) != NOTIFY_STATUS_OK || !(sel & VF_SEL_VALID)) return;
-    int preset = VF_ST_PRESET(sel);
-    if (preset >= VF_PRESET_COUNT) return;
-    CFPreferencesSetAppValue(CFSTR("preset"), (__bridge CFNumberRef)@(preset), VF_PREFS_DOMAIN);
-    CFPreferencesSetAppValue(CFSTR("enabled"), kCFBooleanTrue, VF_PREFS_DOMAIN);
-    if (sel & VF_SEL_HAS_PITCH) {
-        CFPreferencesSetAppValue(CFSTR("customPitch"), (__bridge CFNumberRef)@(VF_ST_PITCH(sel)), VF_PREFS_DOMAIN);
-        CFPreferencesSetAppValue(CFSTR("customFormant"), (__bridge CFNumberRef)@(VF_ST_FORMANT(sel)), VF_PREFS_DOMAIN);
+    NSString *name = (__bridge NSString *)n;
+    if (![name hasPrefix:@VF_SELECT_PREFIX]) return;
+    NSString *arg = [name substringFromIndex:strlen(VF_SELECT_PREFIX)];
+    if ([arg hasPrefix:@"preset."]) {
+        int preset = [arg substringFromIndex:7].intValue;
+        if (preset < 0 || preset >= VF_PRESET_COUNT) return;
+        CFPreferencesSetAppValue(CFSTR("preset"), (__bridge CFNumberRef)@(preset), VF_PREFS_DOMAIN);
+    } else if ([arg hasPrefix:@"pitch."]) {
+        int p = [arg substringFromIndex:6].intValue;
+        if (p < 50 || p > 250) return;
+        // formants follow the pitch at a cube-root rate (1.7 -> 1.19, 0.8 -> 0.93), which keeps it natural
+        double pitch = p / 100.0, formant = round(pow(pitch, 0.33) * 100) / 100;
+        CFPreferencesSetAppValue(CFSTR("preset"), (__bridge CFNumberRef)@(VF_PRESET_CUSTOM), VF_PREFS_DOMAIN);
+        CFPreferencesSetAppValue(CFSTR("customPitch"), (__bridge CFNumberRef)@(pitch), VF_PREFS_DOMAIN);
+        CFPreferencesSetAppValue(CFSTR("customFormant"), (__bridge CFNumberRef)@(formant), VF_PREFS_DOMAIN);
+    } else {
+        return;
     }
+    CFPreferencesSetAppValue(CFSTR("enabled"), kCFBooleanTrue, VF_PREFS_DOMAIN);
     CFPreferencesAppSynchronize(VF_PREFS_DOMAIN);
     vf_publish();
+}
+
+static void vf_observe_select(NSString *suffix) {
+    NSString *name = [@VF_SELECT_PREFIX stringByAppendingString:suffix];
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_select_changed,
+                                    (__bridge CFStringRef)name, NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 }
 
 static void vf_springboard_init(void) {
     notify_register_check(VF_STATE_NAME, &sSBStateToken);
     notify_register_check(VF_TARGET_NAME, &sSBTargetToken);
-    notify_register_check(VF_SELECT_NAME, &sSBSelectToken);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_prefs_changed,
                                     CFSTR(VF_PREFS_CHANGED), NULL, CFNotificationSuspensionBehaviorCoalesce);
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_select_changed,
-                                    CFSTR(VF_SELECT_NAME), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    for (int i = 0; i < VF_PRESET_COUNT; i++) vf_observe_select([NSString stringWithFormat:@"preset.%d", i]);
+    for (size_t i = 0; i < sizeof kSelectPitches / sizeof *kSelectPitches; i++)
+        vf_observe_select([NSString stringWithFormat:@"pitch.%d", kSelectPitches[i]]);
     dispatch_async(dispatch_get_main_queue(), ^{
         sCallWatcher = [VFCallWatcher new];
     });
@@ -438,7 +451,7 @@ static void vf_audio_init(void) {
 // In-call screen (InCallService): floating button + voice menu
 // =====================================================================================
 
-static int sICStateToken = -1, sICSelectToken = -1;
+static int sICStateToken = -1;
 
 static const int kMenuPresets[] = { VF_PRESET_NORMAL, VF_PRESET_FEMALE, VF_PRESET_NARRATOR, VF_PRESET_DARK_LORD,
                                     VF_PRESET_TENOR, VF_PRESET_SMURF, VF_PRESET_CHIPMUNK, VF_PRESET_CUSTOM };
@@ -454,27 +467,30 @@ static uint64_t vf_ic_state(void) {
     return s;
 }
 
-// Custom pitch from the menu: formants follow at a cube-root rate, which keeps the voice
-// natural (pitch 1.7 -> formant 1.19, close to the Female preset; 0.8 -> 0.93).
+// pitchX100 > 0 selects Custom with that pitch; otherwise selects the preset as saved
 static void vf_ic_select(int preset, int pitchX100) {
-    uint64_t sel = (uint64_t)preset | VF_SEL_VALID;
-    if (pitchX100 > 0) {
-        float pitch = pitchX100 / 100.0f;
-        uint64_t formant = (uint64_t)lroundf(powf(pitch, 0.33f) * 100);
-        sel |= VF_SEL_HAS_PITCH | (uint64_t)pitchX100 << 16 | formant << 24;
-    }
-    notify_set_state(sICSelectToken, sel);
-    notify_post(VF_SELECT_NAME);
+    char name[96];
+    if (pitchX100 > 0) snprintf(name, sizeof name, VF_SELECT_PREFIX "pitch.%d", pitchX100);
+    else snprintf(name, sizeof name, VF_SELECT_PREFIX "preset.%d", preset);
+    uint32_t r = notify_post(name);
+    if (r != NOTIFY_STATUS_OK) VFLog("notify_post(%{public}s) failed: %u", name, r);
+}
+
+static NSString *vf_short_title(int preset) {
+    for (int i = 0; i < kMenuCount; i++)
+        if (kMenuPresets[i] == preset) return kMenuTitles[i];
+    return @"Voice";
 }
 
 @interface VFInCallUI : NSObject
 + (instancetype)shared;
-- (void)attachTo:(UIView *)host;
+- (void)attachTo:(UIView *)host preferred:(BOOL)preferred;
 - (void)stateChanged;
 @end
 
 @implementation VFInCallUI {
     __weak UIView *_host;
+    BOOL _hostPreferred;   // attached to the voice-call screen itself (not the fallback root)
     UIButton *_button;
     UIControl *_backdrop;
     UIVisualEffectView *_panel;
@@ -512,7 +528,7 @@ static void vf_ic_select(int preset, int pitchX100) {
 
 - (void)stateChanged {
     [self readState];
-    if (!(vf_ic_state() & VF_ST_BUTTON)) {
+    if (vf_ic_state() & VF_ST_HIDE_BUTTON) {
         [self detach];
         return;
     }
@@ -522,29 +538,45 @@ static void vf_ic_select(int preset, int pitchX100) {
 // ------------------------------------------------------------------ button
 
 - (UIButton *)makeButton {
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(0, 0, 56, 56);
-    b.layer.cornerRadius = 16;
-    b.clipsToBounds = YES;
-    UIVisualEffectView *bg = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
-    bg.frame = b.bounds;
-    bg.userInteractionEnabled = NO;
-    bg.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [b insertSubview:bg atIndex:0];
-    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:24 weight:UIImageSymbolWeightSemibold];
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.layer.cornerRadius = 20;
+    b.layer.borderWidth = 1;
+    b.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.25].CGColor;
+    UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:15 weight:UIImageSymbolWeightBold];
     [b setImage:[UIImage systemImageNamed:@"waveform" withConfiguration:cfg] forState:UIControlStateNormal];
+    b.tintColor = UIColor.whiteColor;
+    b.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightBold];
+    [b setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    b.contentEdgeInsets = UIEdgeInsetsMake(0, 14, 0, 20);
+    b.titleEdgeInsets = UIEdgeInsetsMake(0, 6, 0, -6);
     [b addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
-    b.accessibilityLabel = @"Voice changer";
+    b.accessibilityLabel = @"VoiceForge voice changer";
     return b;
+}
+
+// title shows the current voice; purple while a voice is active
+- (void)updateButton {
+    if (!_button) return;
+    BOOL active = _enabled && _shownPreset != VF_PRESET_NORMAL;
+    NSString *title = !active ? @"Voice"
+                    : _shownPreset == VF_PRESET_CUSTOM ? [NSString stringWithFormat:@"Custom %.1f", _shownPitch / 100.0]
+                    : vf_short_title(_shownPreset);
+    [_button setTitle:title forState:UIControlStateNormal];
+    _button.backgroundColor = active ? [UIColor colorWithRed:0.45 green:0.32 blue:0.98 alpha:0.95]
+                                     : [UIColor colorWithWhite:0.18 alpha:0.9];
+    CGPoint c = _button.center;
+    CGSize size = [_button sizeThatFits:CGSizeMake(400, 40)];
+    _button.bounds = CGRectMake(0, 0, ceil(size.width) + 6, 40);
+    _button.center = c;
 }
 
 - (CGPoint)clamp:(CGPoint)p {
     UIView *host = _host;
     UIEdgeInsets s = host.safeAreaInsets;
-    CGFloat r = 28 + 8;
-    p.x = fmax(r, fmin(host.bounds.size.width - r, p.x));
-    p.y = fmax(s.top + r, fmin(host.bounds.size.height - s.bottom - r, p.y));
+    CGFloat rx = _button.bounds.size.width / 2 + 8, ry = _button.bounds.size.height / 2 + 8;
+    p.x = fmax(rx, fmin(host.bounds.size.width - rx, p.x));
+    p.y = fmax(s.top + ry, fmin(host.bounds.size.height - s.bottom - ry, p.y));
     return p;
 }
 
@@ -556,30 +588,39 @@ static void vf_ic_select(int preset, int pitchX100) {
     [g setTranslation:CGPointZero inView:host];
     if (g.state == UIGestureRecognizerStateEnded || g.state == UIGestureRecognizerStateCancelled) {
         _button.center = [self clamp:_button.center];
-        [NSUserDefaults.standardUserDefaults setObject:NSStringFromCGPoint(_button.center) forKey:@"VoiceForgeButtonCenter"];
+        [NSUserDefaults.standardUserDefaults setObject:NSStringFromCGPoint(_button.center) forKey:@"VoiceForgeButtonCenter.v2"];
     }
 }
 
-- (void)attachTo:(UIView *)host {
+- (void)attachTo:(UIView *)host preferred:(BOOL)preferred {
     [self readState];
-    if (!(vf_ic_state() & VF_ST_BUTTON)) {
+    if (vf_ic_state() & VF_ST_HIDE_BUTTON) {
         [self detach];
         return;
     }
-    if (_host == host && _button.superview == host) {
+    UIView *current = _host;
+    // keep the button on the call screen; the root view is only a fallback
+    if (!preferred && _hostPreferred && current.window && current != host) return;
+    if (current == host && _button.superview == host) {
         [host bringSubviewToFront:_button];
         [self refresh];
         return;
     }
     [self closeMenu];
     _host = host;
+    _hostPreferred = preferred;
     if (!_button) _button = [self makeButton];
     [host addSubview:_button];
-    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"VoiceForgeButtonCenter"];
+    [self updateButton];
+    // default: right edge, below where other in-call buttons usually sit
+    NSString *saved = [NSUserDefaults.standardUserDefaults stringForKey:@"VoiceForgeButtonCenter.v2"];
     CGPoint c = saved ? CGPointFromString(saved)
-                      : CGPointMake(host.bounds.size.width - 36, host.safeAreaInsets.top + 115);
+                      : CGPointMake(host.bounds.size.width - 16 - _button.bounds.size.width / 2,
+                                    host.safeAreaInsets.top + 205);
     _button.center = [self clamp:c];
     [self refresh];
+    VFLog("in-call button attached to %{public}@ (%{public}s)", NSStringFromClass(host.class),
+          preferred ? "call screen" : "fallback root");
 }
 
 - (void)detach {
@@ -723,8 +764,7 @@ static void vf_ic_select(int preset, int pitchX100) {
 }
 
 - (void)refresh {
-    BOOL active = _enabled && _shownPreset != VF_PRESET_NORMAL;
-    _button.tintColor = active ? UIColor.systemGreenColor : UIColor.whiteColor;
+    [self updateButton];
     for (UIButton *b in _presetButtons) [self styleChip:b selected:b.tag == _shownPreset];
     for (UIButton *b in _pitchButtons)
         [self styleChip:b selected:_shownPreset == VF_PRESET_CUSTOM && labs((long)b.tag - _shownPitch) <= 1];
@@ -779,9 +819,17 @@ static void vf_ic_state_changed(CFNotificationCenterRef c, void *o, CFStringRef 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     NSString *cls = NSStringFromClass(self.class);
-    if (vf_ic_state() & VF_ST_DEBUG) VFLog("InCallService view controller appeared: %{public}@", cls);
-    // PHAudioCallViewController is the voice-call screen (name matched loosely across iOS versions)
-    if ([cls containsString:@"AudioCallViewController"]) [[VFInCallUI shared] attachTo:self.view];
+    static NSMutableSet<NSString *> *seen;
+    if (!seen) seen = [NSMutableSet set];
+    if (![seen containsObject:cls]) {
+        [seen addObject:cls];
+        VFLog("InCallService screen appeared: %{public}@", cls);
+    }
+    // PHAudioCallViewController is the voice-call screen (matched loosely across iOS versions);
+    // PHInCallRootViewController hosts it and is the fallback
+    BOOL callScreen = [cls containsString:@"AudioCallViewController"];
+    if (callScreen || [cls containsString:@"InCallRootViewController"])
+        [[VFInCallUI shared] attachTo:self.view preferred:callScreen];
 }
 %end
 
@@ -789,9 +837,9 @@ static void vf_ic_state_changed(CFNotificationCenterRef c, void *o, CFStringRef 
 
 static void vf_incall_init(void) {
     notify_register_check(VF_STATE_NAME, &sICStateToken);
-    notify_register_check(VF_SELECT_NAME, &sICSelectToken);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL, vf_ic_state_changed,
                                     CFSTR(VF_STATE_NAME), NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+    VFLog("loaded into InCallService, state token %d, state=0x%llx", sICStateToken, vf_ic_state());
 }
 
 %ctor {

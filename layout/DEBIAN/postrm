@@ -1,4 +1,5 @@
 #!/bin/sh
 killall -9 audiomxd 2>/dev/null
 killall -9 mediaserverd 2>/dev/null
+killall -9 InCallService 2>/dev/null
 exit 0
