@@ -41,7 +41,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.3.0"
+#define VF_VERSION "0.4.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -435,11 +435,18 @@ static void vf_refresh_format(VFSlot *s, AudioUnit unit) {
     }
 }
 
+// 'vlc2' = voice-level stage, late in mediaserverd's uplink voice chain on iOS 15-18.
+// It is a mono audio-effect unit near the end of the mic processing, so changing its output
+// reaches the caller with almost nothing applied after it. This is the auto default.
+#define kVFSubtypeVoiceLevel 'vlc2'
+
 static BOOL vf_target_matches(const VFSlot *s) {
     uint64_t t = sTarget;
     OSType subtype = VF_TG_SUBTYPE(t);
     if (!subtype) {
-        // auto: microphone side of the voice-processing / remote I/O units
+        // auto: the uplink voice-level stage in mediaserverd (what carries the mic on this device),
+        // or the microphone side of a voice-processing / remote I/O unit on setups that use one
+        if (s->desc.componentSubType == kVFSubtypeVoiceLevel && s->fn != VF_FN_RENDER) return YES;
         return s->fn == VF_FN_RENDER && s->bus == 1 && s->desc.componentType == kAudioUnitType_Output &&
                (s->desc.componentSubType == kAudioUnitSubType_VoiceProcessingIO ||
                 s->desc.componentSubType == kAudioUnitSubType_RemoteIO);

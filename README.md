@@ -53,6 +53,12 @@ VoiceForge's; uninstall it to avoid two tweaks changing the call audio.
 
 ## Finding the call audio path (first-time setup)
 
+**On iOS 15-18 the call mic audio runs through a chain of audio-effect units in `mediaserverd`**, not
+through a voice-processing I/O unit. VoiceForge's auto target is the `vlc2` (voice-level) stage near the
+end of that uplink chain. If your voice still doesn't change, open the diagnostics file, find a mono
+`float32` unit while `audio-inCall=1`, and set **Target** to it, e.g. `process:vlc2:0`, `process:nnet:0`,
+`multi:egt3:0`, or `process:firf:0`. The Target field applies live, with no reinstall.
+
 VoiceForge writes `/var/mobile/Documents/VoiceForge-diagnostics.txt` (open it in Filza). It records
 whether `audiomxd` loaded the tweak and could read the settings, what SpringBoard published, and
 every audio unit and audio converter the audio server uses, refreshed when a call starts. Make a
