@@ -1,0 +1,7 @@
+.theos/
+packages/
+obj/
+*.o
+vftest
+vftest.exe
+out/

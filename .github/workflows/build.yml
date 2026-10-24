@@ -1,0 +1,75 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  dsp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the DSP test on the sample voice
+        run: |
+          cc -O2 -Wall -Wextra -std=c11 -o vftest VFDSP.c test/vftest.c -lm
+          mkdir -p out && ./vftest samples/original.wav out
+
+  package:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scheme: roothide
+            theos: roothide/theos
+          - scheme: rootless
+            theos: theos/theos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: brew install make ldid xz dpkg
+
+      - name: Install Theos (${{ matrix.theos }}) and iOS SDKs
+        run: |
+          git clone --recursive --depth 1 https://github.com/${{ matrix.theos }}.git "$HOME/theos"
+          git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos-sdks"
+          mkdir -p "$HOME/theos/sdks"
+          cp -R "$HOME"/theos-sdks/*.sdk "$HOME/theos/sdks/"
+          ls "$HOME/theos/sdks"
+
+      - name: Build package
+        run: |
+          export THEOS="$HOME/theos"
+          TARGET_ARG=""
+          if [ -d "$HOME/theos/sdks/iPhoneOS16.5.sdk" ]; then TARGET_ARG="TARGET=iphone:clang:16.5:15.0"; fi
+          gmake package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=${{ matrix.scheme }} $TARGET_ARG
+          ls -la packages
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceForge-${{ matrix.scheme }}
+          path: packages/*.deb
+
+  # attach whatever packages built to a GitHub Release so they can be downloaded directly
+  release:
+    needs: package
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la dist
+          ls dist/*.deb >/dev/null 2>&1 || { echo "no packages built"; exit 1; }
+          gh release create "build-${{ github.run_number }}" dist/*.deb \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "VoiceForge build ${{ github.run_number }}" \
+            --notes "Built from ${GITHUB_SHA::7}. Install the roothide package on roothide jailbreaks."
