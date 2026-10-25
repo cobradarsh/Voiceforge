@@ -752,6 +752,58 @@ static NSString *vf_short_title(int preset) {
     return @"Voice";
 }
 
+// --- CallHider integration ---------------------------------------------------
+// Don't show the in-call overlay for callers CallHider is hiding. We ask
+// TUCallCenter for the current non-outgoing call and match its handle/contact
+// against CallHider's shared hidden list (com.cobradarsh.callhider).
+@interface VFTUHandle : NSObject
+@property (nonatomic, readonly, copy) NSString *value;
+@end
+@interface VFTUCall : NSObject
+@property (nonatomic, readonly, getter=isOutgoing) BOOL outgoing;
+@property (nonatomic, readonly) VFTUHandle *handle;
+@property (nonatomic, readonly, copy) NSString *contactIdentifier;
+@end
+@interface VFTUCallCenter : NSObject
++ (instancetype)sharedInstance;
+- (NSArray *)currentCalls;
+@end
+
+static NSString *vf_last10(NSString *raw) {
+    if (![raw isKindOfClass:NSString.class] || raw.length == 0) return nil;
+    NSMutableString *d = [NSMutableString string];
+    for (NSUInteger i = 0; i < raw.length; i++) { unichar c = [raw characterAtIndex:i]; if (c >= '0' && c <= '9') [d appendFormat:@"%C", c]; }
+    if (d.length == 0) return nil;
+    return d.length > 10 ? [d substringFromIndex:d.length - 10] : d;
+}
+
+static BOOL vf_call_hidden_by_callhider(void) {
+    CFStringRef dom = CFSTR("com.cobradarsh.callhider");
+    CFPreferencesAppSynchronize(dom);
+    id en = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"), dom, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (en != nil && ![en boolValue]) return NO;
+    NSArray *hidden = (__bridge_transfer NSArray *)CFPreferencesCopyValue(CFSTR("hiddenContacts"), dom, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
+    if (![hidden isKindOfClass:NSArray.class] || hidden.count == 0) return NO;
+
+    Class ccCls = NSClassFromString(@"TUCallCenter");
+    id center = [ccCls respondsToSelector:@selector(sharedInstance)] ? [ccCls sharedInstance] : nil;
+    for (VFTUCall *call in [center currentCalls]) {
+        @try {
+            if (call.isOutgoing) continue;
+            NSString *cid = call.contactIdentifier;
+            NSString *num = vf_last10(call.handle.value);
+            for (NSDictionary *e in hidden) {
+                if (![e isKindOfClass:NSDictionary.class]) continue;
+                id eid = e[@"id"];
+                if (cid.length && [eid isKindOfClass:NSString.class] && [eid isEqualToString:cid]) return YES;
+                if (num.length) for (NSString *n in e[@"numbers"])
+                    if ([n isKindOfClass:NSString.class] && n.length && ([num hasSuffix:n] || [n hasSuffix:num])) return YES;
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    return NO;
+}
+
 @implementation VFInCallUI {
     VFOverlayWindow *_window;
     UIView *_host;         // the overlay window's root view (full screen)
@@ -793,7 +845,7 @@ static NSString *vf_short_title(int preset) {
 // called by the call watcher whenever any call starts or ends
 - (void)callStateChanged {
     dispatch_async(dispatch_get_main_queue(), ^{
-        if (sInCall && vf_pref_bool(@"inCallButton", YES)) [self show];
+        if (sInCall && vf_pref_bool(@"inCallButton", YES) && !vf_call_hidden_by_callhider()) [self show];
         else [self hide];
     });
 }
