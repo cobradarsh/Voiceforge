@@ -15,7 +15,7 @@ jobs:
           mkdir -p out && ./vftest samples/original.wav out
 
   package:
-    runs-on: macos-14
+    runs-on: macos-latest
     strategy:
       fail-fast: false
       matrix:
