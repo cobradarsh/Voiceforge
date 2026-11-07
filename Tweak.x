@@ -41,7 +41,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.6.2"
+#define VF_VERSION "0.7.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -306,7 +306,8 @@ static void vf_springboard_init(void) {
 // Audio server side
 // =====================================================================================
 
-#define VF_MAX_SLOTS 64
+#define VF_MAX_SLOTS 256
+#define VF_STALE_TICKS 50000   // a unit unseen for this many hook calls may give up its slot
 #define VF_CHUNK 4096
 
 typedef struct {
@@ -321,6 +322,7 @@ typedef struct {
     uint32_t seenGen;                    // log / params generation last applied
     uint32_t reportedGen;                // diagnostics generation last reported
     uint32_t callsSinceReport;
+    uint32_t lastSeen;                   // sTick when the unit was last handled
     VFEngine *engine;
     float *scratch;
 } VFSlot;
@@ -329,6 +331,7 @@ static VFSlot sSlots[VF_MAX_SLOTS];
 static int sAudioStateToken = -1, sAudioTargetToken = -1;
 static uint64_t sState, sTarget;
 static volatile uint32_t sGen = 1;
+static volatile uint32_t sTick;
 
 static dispatch_queue_t sDiagQueue;
 static int sDiagA[VF_DIAG_SLOTS], sDiagB[VF_DIAG_SLOTS];
@@ -404,31 +407,54 @@ static void vf_fourcc_str(OSType v, char out[5]) {
     out[4] = 0;
 }
 
+static void vf_slot_init(VFSlot *s, AudioUnit unit, int fn, UInt32 bus, uint32_t tick) {
+    s->fn = fn;
+    s->bus = bus;
+    s->fmtValid = 0;
+    s->fmtAge = 0;
+    s->seenGen = 0;
+    s->reportedGen = 0;
+    s->callsSinceReport = 0;
+    s->lastSeen = tick;
+    memset(&s->desc, 0, sizeof s->desc);
+    AudioComponent comp = AudioComponentInstanceGetComponent(unit);
+    if (comp) AudioComponentGetDescription(comp, &s->desc);
+    __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+}
+
 static VFSlot *vf_slot(AudioUnit unit, int fn, UInt32 bus) {
+    uint32_t tick = __atomic_add_fetch(&sTick, 1, __ATOMIC_RELAXED);
     for (int i = 0; i < VF_MAX_SLOTS; i++) {
         VFSlot *s = &sSlots[i];
-        if (s->unit == unit && __atomic_load_n(&s->ready, __ATOMIC_ACQUIRE) && s->fn == fn && s->bus == bus) return s;
+        if (s->unit == unit && __atomic_load_n(&s->ready, __ATOMIC_ACQUIRE) && s->fn == fn && s->bus == bus) {
+            s->lastSeen = tick;
+            return s;
+        }
     }
     for (int i = 0; i < VF_MAX_SLOTS; i++) {
         VFSlot *s = &sSlots[i];
         void *expected = NULL;
         if (!s->unit && __atomic_compare_exchange_n(&s->unit, &expected, (void *)unit, false,
                                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            s->fn = fn;
-            s->bus = bus;
-            s->fmtValid = 0;
-            s->fmtAge = 0;
-            s->seenGen = 0;
-            s->reportedGen = 0;
-            s->callsSinceReport = 0;
-            memset(&s->desc, 0, sizeof s->desc);
-            AudioComponent comp = AudioComponentInstanceGetComponent(unit);
-            if (comp) AudioComponentGetDescription(comp, &s->desc);
-            __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+            vf_slot_init(s, unit, fn, bus, tick);
             return s;
         }
     }
-    return NULL;
+    // Table full (e.g. the call route changed and the old units were never disposed):
+    // take over the slot unseen for longest, if it has been idle a while and owns no engine.
+    VFSlot *oldest = NULL;
+    for (int i = 0; i < VF_MAX_SLOTS; i++) {
+        VFSlot *s = &sSlots[i];
+        if (s->engine || tick - s->lastSeen < VF_STALE_TICKS) continue;
+        if (!oldest || (int32_t)(s->lastSeen - oldest->lastSeen) < 0) oldest = s;
+    }
+    if (!oldest) return NULL;
+    void *expected = oldest->unit;
+    __atomic_store_n(&oldest->ready, 0, __ATOMIC_RELEASE);
+    if (!__atomic_compare_exchange_n(&oldest->unit, &expected, (void *)unit, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return NULL;
+    vf_slot_init(oldest, unit, fn, bus, tick);
+    return oldest;
 }
 
 static void vf_refresh_format(VFSlot *s, AudioUnit unit) {
@@ -452,12 +478,12 @@ static BOOL vf_target_matches(const VFSlot *s) {
     uint64_t t = sTarget;
     OSType subtype = VF_TG_SUBTYPE(t);
     if (!subtype) {
-        // auto: the uplink voice-level stage in mediaserverd (what carries the mic on this device),
-        // or the microphone side of a voice-processing / remote I/O unit on setups that use one
+        // auto: the uplink voice stage in mediaserverd (what carries the mic on this device),
+        // or the microphone side of a voice-processing I/O unit on setups that use one.
+        // (Plain RemoteIO is deliberately excluded: the camera and recording apps use it too.)
         if (s->desc.componentSubType == kVFSubtypeVoiceStage && s->fn != VF_FN_RENDER) return YES;
         return s->fn == VF_FN_RENDER && s->bus == 1 && s->desc.componentType == kAudioUnitType_Output &&
-               (s->desc.componentSubType == kAudioUnitSubType_VoiceProcessingIO ||
-                s->desc.componentSubType == kAudioUnitSubType_RemoteIO);
+               s->desc.componentSubType == kAudioUnitSubType_VoiceProcessingIO;
     }
     if (s->desc.componentSubType != subtype) return NO;
     if (VF_TG_FN(t) != VF_FN_ANY && VF_TG_FN(t) != s->fn) return NO;
@@ -540,24 +566,29 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
     if (!unit || !abl) return;
     vf_refresh_state();
     uint64_t st = sState;
+    // The audio server also runs the camera, music, Siri and recording. Outside a call (unless
+    // "Process outside calls" is on) do nothing at all, so those are never touched.
+    if (!(st & (VF_ST_INCALL | VF_ST_ALWAYS))) return;
     BOOL debug = (st & VF_ST_DEBUG) != 0;
-    BOOL wantProcess = (st & VF_ST_ENABLED) && VF_ST_PRESET(st) != VF_PRESET_NORMAL &&
-                       (st & (VF_ST_INCALL | VF_ST_ALWAYS));
+    BOOL wantProcess = (st & VF_ST_ENABLED) && VF_ST_PRESET(st) != VF_PRESET_NORMAL;
+    if (!wantProcess && !debug) return;
 
     VFSlot *s = vf_slot(unit, fn, bus);
     if (!s) return;
+    BOOL match = vf_target_matches(s);
+    // Only the unit being changed is ever queried; querying others from their own render thread
+    // can stall them. Discovery logging lifts this to report every unit.
+    if (!match && !debug) return;
     vf_refresh_format(s, unit);
     if (!s->fmtValid) return;
 
     uint32_t gen = __atomic_load_n(&sGen, __ATOMIC_RELAXED);
-    BOOL match = vf_target_matches(s);
-    // report each active unit on every state change (e.g. call start) and every few thousand buffers
-    if (s->reportedGen != gen || ++s->callsSinceReport >= 4000) {
+    if (debug && (s->reportedGen != gen || ++s->callsSinceReport >= 4000)) {
         s->reportedGen = gen;
         s->callsSinceReport = 0;
         vf_diag_send(((uint64_t)s->desc.componentType << 32) | s->desc.componentSubType,
                      vf_diag_word(VF_DIAG_UNIT, fn, bus, &s->fmt, frames, match, wantProcess));
-        if (debug) vf_log_slot(s, frames, match);
+        vf_log_slot(s, frames, match);
     }
     if (!match || !wantProcess) {
         s->seenGen = gen;
@@ -571,52 +602,6 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
                      vf_diag_word(VF_DIAG_PROCESSING, fn, (UInt32)VF_ST_PRESET(st), &s->fmt, frames, match, wantProcess));
     }
     vf_process_abl(s, abl, frames);
-}
-
-// ---- audio converters (reported for diagnostics only)
-
-typedef struct {
-    void *volatile conv;
-    int fn;
-    uint32_t calls;
-    uint32_t reportedGen;
-} VFConvSlot;
-
-static VFConvSlot sConvs[64];
-
-static void vf_converter_seen(AudioConverterRef conv, int fn, UInt32 frames) {
-    if (!conv || !sDiagQueue) return;
-    vf_refresh_state();
-    VFConvSlot *c = NULL;
-    for (int i = 0; i < 64 && !c; i++)
-        if (sConvs[i].conv == conv && sConvs[i].fn == fn) c = &sConvs[i];
-    for (int i = 0; i < 64 && !c; i++) {
-        void *expected = NULL;
-        if (!sConvs[i].conv && __atomic_compare_exchange_n(&sConvs[i].conv, &expected, (void *)conv, false,
-                                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-            c = &sConvs[i];
-            c->fn = fn;
-            c->calls = 0;
-            c->reportedGen = 0;
-        }
-    }
-    if (!c) return;
-    uint32_t gen = __atomic_load_n(&sGen, __ATOMIC_RELAXED);
-    if (c->reportedGen == gen && ++c->calls < 4000) return;
-    c->reportedGen = gen;
-    c->calls = 0;
-    AudioStreamBasicDescription in = {0}, out = {0};
-    UInt32 size = sizeof in;
-    AudioConverterGetProperty(conv, kAudioConverterCurrentInputStreamDescription, &size, &in);
-    size = sizeof out;
-    AudioConverterGetProperty(conv, kAudioConverterCurrentOutputStreamDescription, &size, &out);
-    vf_diag_send(((uint64_t)in.mFormatID << 32) | out.mFormatID,
-                 vf_diag_word(VF_DIAG_CONVERTER, fn, (UInt32)(in.mSampleRate / 1000), &out, frames, NO, NO));
-}
-
-static void vf_release_converter(AudioConverterRef conv) {
-    for (int i = 0; i < 64; i++)
-        if (sConvs[i].conv == conv) __atomic_store_n(&sConvs[i].conv, NULL, __ATOMIC_RELEASE);
 }
 
 static void vf_release_unit(AudioComponentInstance unit) {
@@ -656,23 +641,6 @@ static void vf_release_unit(AudioComponentInstance unit) {
 
 %hookf(OSStatus, AudioComponentInstanceDispose, AudioComponentInstance unit) {
     vf_release_unit(unit);
-    return %orig;
-}
-
-%hookf(OSStatus, AudioConverterConvertComplexBuffer, AudioConverterRef conv, UInt32 frames, const AudioBufferList *inData, AudioBufferList *outData) {
-    OSStatus r = %orig;
-    if (r == noErr) vf_converter_seen(conv, 1, frames);
-    return r;
-}
-
-%hookf(OSStatus, AudioConverterFillComplexBuffer, AudioConverterRef conv, AudioConverterComplexInputDataProc proc, void *userData, UInt32 *ioPackets, AudioBufferList *outData, AudioStreamPacketDescription *outDesc) {
-    OSStatus r = %orig;
-    vf_converter_seen(conv, 2, ioPackets ? *ioPackets : 0);
-    return r;
-}
-
-%hookf(OSStatus, AudioConverterDispose, AudioConverterRef conv) {
-    vf_release_converter(conv);
     return %orig;
 }
 

@@ -56,10 +56,13 @@ through a voice-processing I/O unit. VoiceForge's auto target is the `egt3` stag
 iOS 16.5). If your voice still doesn't change, open the diagnostics file, find a mono
 `float32` unit while `audio-inCall=1`, and set **Target** to it, e.g. `multi:egt3:0`, `process:vlc2:0`, `process:nnet:0`, or `process:firf:0`. The Target field applies live, with no reinstall.
 
-VoiceForge writes `/var/mobile/Documents/VoiceForge-diagnostics.txt` (open it in Filza). It records
-whether `audiomxd` loaded the tweak and could read the settings, what SpringBoard published, and
-every audio unit and audio converter the audio server uses, refreshed when a call starts. Make a
-short call while talking, then share that file to find the right target.
+VoiceForge writes `/var/mobile/Documents/VoiceForge-diagnostics.txt` (open it in Filza). It always
+records whether the audio server loaded the tweak and could read the settings, what SpringBoard
+published, and when processing starts. With **Discovery logging** on, it also lists every audio unit
+the audio server uses **during calls** (refreshed when the call or its route changes). Turn Discovery
+logging on, make a short call while talking, then share that file to find the right target.
+
+Outside calls the hooks do nothing at all, so the camera, music and recording apps are never touched.
 
 Apple doesn't document which audio unit carries the uplink (your voice) during a cellular call,
 and it differs between iOS versions. VoiceForge hooks the public AudioToolbox entry points and
@@ -76,7 +79,8 @@ doesn't change on a call:
 4. Put the candidate into **Target** as `fn:subtype:bus`, e.g. `process:vp4 :0` (the subtype is
    always 4 characters; keep trailing spaces), and test again. `MATCH` in the log shows what is being processed.
 
-The **Process outside calls** switch applies the voice without a call, for quick tests.
+The **Process outside calls** switch applies the voice without a call, for quick tests. Leave it off
+normally: while it is on, the hooks also run for the camera and recording apps.
 
 ## Layout
 
