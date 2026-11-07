@@ -10,6 +10,7 @@
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CallKit/CallKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import <notify.h>
 #import <os/log.h>
 #include <stdlib.h>
@@ -41,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.7.0"
+#define VF_VERSION "0.7.1"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -184,6 +185,82 @@ static uint64_t vf_parse_target(NSString *spec) {
     return (uint64_t)subtype | ((uint64_t)fn.intValue << 32) | (bus << 36);
 }
 
+// ---- Sweep mode: Target = "sweep". During a call SpringBoard cycles the published target through
+// every plausible voice stage, a few seconds each, and writes the step times to the diagnostics
+// file. Listening back (e.g. a voicemail greeting recorded on speaker) shows which step changed the
+// voice, which names the stage for that audio route. Nothing on the audio side changes.
+static const char *kSweepStages[] = {
+    "egt3", "nnet", "vlc2", "dees", "ldnm", "vrq2", "amsk", "clsl", "gltc", "vben", "firf", "cngn",
+    "dydk", "sfcl", "lkir", "buzk", "mstk", "cfrk", "tmst", "sdly", "lec5", "dspg", "sila", "nbeq",
+};
+#define VF_SWEEP_COUNT ((int)(sizeof kSweepStages / sizeof *kSweepStages))
+#define VF_SWEEP_SECONDS 5.0
+static int sSweepStep = -1;
+static NSTimer *sSweepTimer;
+static NSTimer *sRouteTimer;
+static NSString *sLastRoute;
+
+static BOOL vf_sweep_requested(void) {
+    id spec = vf_pref(@"targetSpec");
+    return [spec isKindOfClass:NSString.class] && [[spec lowercaseString] isEqualToString:@"sweep"];
+}
+
+static uint64_t vf_sweep_target(void) {
+    if (sSweepStep < 0) return 0;
+    const char *c = kSweepStages[sSweepStep % VF_SWEEP_COUNT];
+    OSType sub = ((OSType)c[0] << 24) | ((OSType)c[1] << 16) | ((OSType)c[2] << 8) | (OSType)c[3];
+    return (uint64_t)sub | ((uint64_t)VF_FN_ANY << 32) | (0xffULL << 36);   // any fn, any bus
+}
+
+static void vf_publish(void);
+
+static void vf_sweep_tick(void) {
+    sSweepStep = sSweepStep < 0 ? 0 : sSweepStep + 1;
+    int i = sSweepStep % VF_SWEEP_COUNT;
+    vf_diag_write([NSString stringWithFormat:@"SWEEP step %d/%d: now changing stage '%s'%@",
+                   i + 1, VF_SWEEP_COUNT, kSweepStages[i], sSweepStep >= VF_SWEEP_COUNT ? @" (second pass)" : @""]);
+    vf_publish();
+}
+
+static NSString *vf_current_route(void) {
+    NSMutableArray *parts = [NSMutableArray array];
+    for (AVAudioSessionPortDescription *port in AVAudioSession.sharedInstance.currentRoute.outputs)
+        [parts addObject:port.portType ?: @"?"];
+    return parts.count ? [parts componentsJoinedByString:@"+"] : @"none";
+}
+
+static void vf_route_tick(void) {
+    NSString *r = vf_current_route();
+    if ([r isEqualToString:sLastRoute]) return;
+    sLastRoute = r;
+    vf_diag_write([NSString stringWithFormat:@"ROUTE: output now %@", r]);
+}
+
+// Called on the main queue whenever the call state or the preferences change.
+static void vf_update_call_timers(void) {
+    BOOL sweep = sInCall && vf_sweep_requested();
+    if (sweep && !sSweepTimer) {
+        sSweepStep = -1;
+        vf_diag_write([NSString stringWithFormat:@"SWEEP started: %d stages, %.0f s each", VF_SWEEP_COUNT, VF_SWEEP_SECONDS]);
+        vf_sweep_tick();
+        sSweepTimer = [NSTimer scheduledTimerWithTimeInterval:VF_SWEEP_SECONDS repeats:YES block:^(NSTimer *t) { vf_sweep_tick(); }];
+    } else if (!sweep && sSweepTimer) {
+        [sSweepTimer invalidate];
+        sSweepTimer = nil;
+        sSweepStep = -1;
+        vf_diag_write(@"SWEEP stopped");
+        vf_publish();
+    }
+    if (sInCall && !sRouteTimer) {
+        sLastRoute = nil;
+        vf_route_tick();
+        sRouteTimer = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { vf_route_tick(); }];
+    } else if (!sInCall && sRouteTimer) {
+        [sRouteTimer invalidate];
+        sRouteTimer = nil;
+    }
+}
+
 static void vf_publish(void) {
     CFPreferencesAppSynchronize(VF_PREFS_DOMAIN);
     uint64_t s = 0;
@@ -200,7 +277,8 @@ static void vf_publish(void) {
     s |= pitch << 16 | formant << 24;
 
     id spec = vf_pref(@"targetSpec");
-    uint64_t target = [spec isKindOfClass:NSString.class] ? vf_parse_target(spec) : 0;
+    uint64_t target = sSweepStep >= 0 ? vf_sweep_target()
+                    : [spec isKindOfClass:NSString.class] ? vf_parse_target(spec) : 0;
 
     notify_set_state(sSBTargetToken, target);
     notify_set_state(sSBStateToken, s);
@@ -243,6 +321,7 @@ static void vf_publish(void) {
         if (!call.hasEnded) active = YES;
     sInCall = active;
     vf_publish();
+    vf_update_call_timers();
     [[VFInCallUI shared] callStateChanged];
 }
 @end
@@ -251,6 +330,7 @@ static VFCallWatcher *sCallWatcher;
 
 static void vf_prefs_changed(CFNotificationCenterRef c, void *o, CFStringRef n, const void *obj, CFDictionaryRef info) {
     vf_publish();
+    dispatch_async(dispatch_get_main_queue(), ^{ vf_update_call_timers(); });
     [[VFInCallUI shared] refreshFromPrefs];
 }
 
