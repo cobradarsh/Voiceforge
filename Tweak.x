@@ -42,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.7.2"
+#define VF_VERSION "0.7.3"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -214,11 +214,24 @@ static uint64_t vf_sweep_target(void) {
 
 static void vf_publish(void);
 
+static void vf_update_call_timers(void);
+
+// Puts Target back to "auto" so a sweep can never outlive the test it was meant for.
+static void vf_sweep_finish(NSString *why) {
+    CFPreferencesSetAppValue(CFSTR("targetSpec"), CFSTR("auto"), VF_PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(VF_PREFS_DOMAIN);
+    vf_diag_write([NSString stringWithFormat:@"SWEEP finished (%@): Target reset to auto", why]);
+    vf_update_call_timers();
+}
+
 static void vf_sweep_tick(void) {
     sSweepStep = sSweepStep < 0 ? 0 : sSweepStep + 1;
-    int i = sSweepStep % VF_SWEEP_COUNT;
-    vf_diag_write([NSString stringWithFormat:@"SWEEP step %d/%d: now changing stage '%s'%@",
-                   i + 1, VF_SWEEP_COUNT, kSweepStages[i], sSweepStep >= VF_SWEEP_COUNT ? @" (second pass)" : @""]);
+    if (sSweepStep >= VF_SWEEP_COUNT) {
+        vf_sweep_finish(@"all stages tried");
+        return;
+    }
+    vf_diag_write([NSString stringWithFormat:@"SWEEP step %d/%d: now changing stage '%s'",
+                   sSweepStep + 1, VF_SWEEP_COUNT, kSweepStages[sSweepStep]]);
     vf_publish();
 }
 
@@ -250,6 +263,8 @@ static void vf_update_call_timers(void) {
         sSweepStep = -1;
         vf_diag_write(@"SWEEP stopped");
         vf_publish();
+        // a sweep cut short by the call ending must not carry over to the next call
+        if (!sInCall && vf_sweep_requested()) vf_sweep_finish(@"call ended");
     }
     if (sInCall && !sRouteTimer) {
         sLastRoute = nil;
