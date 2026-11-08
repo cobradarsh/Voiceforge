@@ -45,11 +45,11 @@ struct VFEngine {
 static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] = {
     [VF_PRESET_NORMAL]    = { "Normal (Off)",  { 1.00f, 1.00f,  0.0f, 0.0f } },
     [VF_PRESET_DARK_LORD] = { "Dark Lord",     { 0.62f, 0.75f,  3.0f, 1.0f } },
-    [VF_PRESET_TENOR]     = { "Tenor",         { 0.80f, 0.80f,  0.0f, 0.0f } },
+    [VF_PRESET_TENOR]     = { "Tenor",         { 0.80f, 0.84f,  0.0f, 0.0f } },
     [VF_PRESET_NARRATOR]  = { "Deep Narrator", { 0.82f, 0.90f,  5.0f, 1.0f } },
     [VF_PRESET_FEMALE]    = { "Female",        { 1.55f, 1.26f, -3.5f, 0.0f } },
-    [VF_PRESET_SMURF]     = { "Smurf",         { 1.60f, 1.60f,  0.0f, 0.0f } },
-    [VF_PRESET_CHIPMUNK]  = { "Chipmunk",      { 2.20f, 2.20f,  0.0f, 0.0f } },
+    [VF_PRESET_SMURF]     = { "Smurf",         { 1.60f, 1.45f,  0.0f, 0.0f } },
+    [VF_PRESET_CHIPMUNK]  = { "Chipmunk",      { 2.20f, 1.80f,  0.0f, 0.0f } },
     [VF_PRESET_CUSTOM]    = { "Custom",        { 1.00f, 1.00f,  0.0f, 0.0f } },
 };
 
@@ -232,7 +232,9 @@ static void process_frame(VFEngine *e) {
     int N = e->N, half = e->half;
     float expct = 2.0f * VF_PI * e->hop / N;
     float pitch = e->cur.pitch, formant = e->cur.formant;
-    int separate = fabsf(pitch - formant) > 1e-3f;
+    // Always run the envelope path. The old shortcut for pitch == formant (plain shift, no
+    // envelope) produced no audible change on some call routes (speaker), so it is gone.
+    const int separate = 1;
 
     // zero-phase windowing: rotate the frame so its centre is at index 0, which makes
     // bin phases independent of the bin index (peaks can then move between bins freely)
