@@ -68,6 +68,9 @@
 			<array>
 				<integer>0</integer>
 				<integer>4</integer>
+				<integer>8</integer>
+				<integer>9</integer>
+				<integer>10</integer>
 				<integer>3</integer>
 				<integer>1</integer>
 				<integer>2</integer>
@@ -79,6 +82,9 @@
 			<array>
 				<string>Normal (Off)</string>
 				<string>Female</string>
+				<string>Young Female</string>
+				<string>Mature Female</string>
+				<string>Senior Female</string>
 				<string>Deep Narrator</string>
 				<string>Dark Lord</string>
 				<string>Tenor</string>
@@ -93,7 +99,7 @@
 			<key>label</key>
 			<string>Custom voice</string>
 			<key>footerText</key>
-			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Female is pitch 1.75 / formant 1.25, Deep Narrator is 0.82 / 0.90. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
+			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Young Female is pitch 1.80 / formant 1.32, Female 1.55 / 1.26, Mature Female 1.42 / 1.20, Senior Female 1.30 / 1.14, Deep Narrator 0.82 / 0.90. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
 		</dict>
 		<dict>
 			<key>cell</key>

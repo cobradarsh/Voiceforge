@@ -42,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.7.3"
+#define VF_VERSION "0.8.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -787,11 +787,13 @@ static void vf_audio_init(void) {
 }
 @end
 
-static const int kMenuPresets[] = { VF_PRESET_NORMAL, VF_PRESET_FEMALE, VF_PRESET_NARRATOR, VF_PRESET_DARK_LORD,
-                                    VF_PRESET_TENOR, VF_PRESET_SMURF, VF_PRESET_CHIPMUNK, VF_PRESET_CUSTOM };
-static NSString *const kMenuTitles[] = { @"Off", @"Female", @"Narrator", @"Dark Lord",
-                                         @"Tenor", @"Smurf", @"Chipmunk", @"Custom" };
-static const int kMenuCount = 8;
+static const int kMenuPresets[] = { VF_PRESET_NORMAL, VF_PRESET_FEMALE, VF_PRESET_FEMALE_YOUNG, VF_PRESET_FEMALE_MATURE,
+                                    VF_PRESET_FEMALE_SENIOR, VF_PRESET_NARRATOR, VF_PRESET_DARK_LORD, VF_PRESET_TENOR,
+                                    VF_PRESET_SMURF, VF_PRESET_CHIPMUNK, VF_PRESET_CUSTOM };
+static NSString *const kMenuTitles[] = { @"Off", @"Female", @"Young F", @"Mature F",
+                                         @"Senior F", @"Narrator", @"Dark Lord", @"Tenor",
+                                         @"Smurf", @"Chipmunk", @"Custom" };
+static const int kMenuCount = 11;
 static const int kLowPitches[] = { 70, 80, 90 };
 static const int kHighPitches[] = { 110, 120, 130, 140, 150, 160, 170, 180, 190, 200 };
 
@@ -1137,7 +1139,8 @@ static BOOL vf_call_hidden_by_callhider(void) {
         [c addSubview:b];
         [_presetButtons addObject:b];
     }
-    y += 2 * ch + gap;
+    int rows = (kMenuCount + 3) / 4;
+    y += rows * ch + (rows - 1) * gap;
 
     if (_customOpen) {
         y += 18;

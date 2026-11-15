@@ -14,6 +14,9 @@ typedef enum {
     VF_PRESET_SMURF,
     VF_PRESET_CHIPMUNK,
     VF_PRESET_CUSTOM,
+    VF_PRESET_FEMALE_YOUNG,   // light, bright young woman
+    VF_PRESET_FEMALE_MATURE,  // fuller middle-aged woman
+    VF_PRESET_FEMALE_SENIOR,  // older woman: lower, softer, slight tremor
     VF_PRESET_COUNT
 } VFPreset;
 
@@ -22,6 +25,7 @@ typedef struct {
     float formant;   // frequency ratio applied to the vocal-tract envelope (1.0 = unchanged)
     float bassDb;    // low-shelf gain at ~180 Hz
     float gainDb;    // output gain before the soft limiter
+    float tremor;    // slow pitch wobble depth (0 = none, 0.03 = +-3 %), ~5.5 Hz
 } VFParams;
 
 typedef struct VFEngine VFEngine;

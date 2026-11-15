@@ -40,17 +40,22 @@ struct VFEngine {
     float b0, b1, b2, a1, a2, z1, z2;
     float outGain;
     float levelGain;   // smoothed loudness compensation
+    float tremorPhase; // radians, for the slow pitch wobble
 };
 
 static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] = {
-    [VF_PRESET_NORMAL]    = { "Normal (Off)",  { 1.00f, 1.00f,  0.0f, 0.0f } },
-    [VF_PRESET_DARK_LORD] = { "Dark Lord",     { 0.62f, 0.75f,  3.0f, 1.0f } },
-    [VF_PRESET_TENOR]     = { "Tenor",         { 0.80f, 0.84f,  0.0f, 0.0f } },
-    [VF_PRESET_NARRATOR]  = { "Deep Narrator", { 0.82f, 0.90f,  5.0f, 1.0f } },
-    [VF_PRESET_FEMALE]    = { "Female",        { 1.55f, 1.26f, -3.5f, 0.0f } },
-    [VF_PRESET_SMURF]     = { "Smurf",         { 1.60f, 1.45f,  0.0f, 0.0f } },
-    [VF_PRESET_CHIPMUNK]  = { "Chipmunk",      { 2.20f, 1.80f,  0.0f, 0.0f } },
-    [VF_PRESET_CUSTOM]    = { "Custom",        { 1.00f, 1.00f,  0.0f, 0.0f } },
+    [VF_PRESET_NORMAL]        = { "Normal (Off)",  { 1.00f, 1.00f,  0.0f, 0.0f, 0.0f } },
+    [VF_PRESET_DARK_LORD]     = { "Dark Lord",     { 0.62f, 0.75f,  3.0f, 1.0f, 0.0f } },
+    [VF_PRESET_TENOR]         = { "Tenor",         { 0.80f, 0.84f,  0.0f, 0.0f, 0.0f } },
+    [VF_PRESET_NARRATOR]      = { "Deep Narrator", { 0.82f, 0.90f,  5.0f, 1.0f, 0.0f } },
+    [VF_PRESET_FEMALE]        = { "Female",        { 1.55f, 1.26f, -3.5f, 0.0f, 0.0f } },
+    [VF_PRESET_SMURF]         = { "Smurf",         { 1.60f, 1.45f,  0.0f, 0.0f, 0.0f } },
+    [VF_PRESET_CHIPMUNK]      = { "Chipmunk",      { 2.20f, 1.80f,  0.0f, 0.0f, 0.0f } },
+    [VF_PRESET_CUSTOM]        = { "Custom",        { 1.00f, 1.00f,  0.0f, 0.0f, 0.0f } },
+    // Female variants: pitch and vocal-tract size fall with age; the senior voice adds a slow tremor.
+    [VF_PRESET_FEMALE_YOUNG]  = { "Young Female",  { 1.80f, 1.32f, -4.5f, 0.0f, 0.0f } },
+    [VF_PRESET_FEMALE_MATURE] = { "Mature Female", { 1.42f, 1.20f, -2.0f, 0.0f, 0.0f } },
+    [VF_PRESET_FEMALE_SENIOR] = { "Senior Female", { 1.30f, 1.14f, -1.0f, -1.0f, 0.035f } },
 };
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -232,6 +237,12 @@ static void process_frame(VFEngine *e) {
     int N = e->N, half = e->half;
     float expct = 2.0f * VF_PI * e->hop / N;
     float pitch = e->cur.pitch, formant = e->cur.formant;
+    if (e->cur.tremor > 0) {
+        // ~5.5 Hz wobble, the rate of an older voice's natural tremor
+        e->tremorPhase += 2.0f * VF_PI * 5.5f * e->hop / (float)e->sr;
+        if (e->tremorPhase > 2.0f * VF_PI) e->tremorPhase -= 2.0f * VF_PI;
+        pitch *= 1.0f + e->cur.tremor * sinf(e->tremorPhase);
+    }
     // Always run the envelope path. The old shortcut for pitch == formant (plain shift, no
     // envelope) produced no audible change on some call routes (speaker), so it is gone.
     const int separate = 1;
