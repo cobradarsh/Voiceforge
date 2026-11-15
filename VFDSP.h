@@ -46,6 +46,10 @@ void vf_reset(VFEngine *e);
 // In-place processing of n mono samples. Output is delayed by vf_latency_samples().
 void vf_process(VFEngine *e, float *buf, int n);
 
+// Percentage of recent non-silent audio in which a voice pitch was tracked (0-100), then resets
+// the counters. Low values on real speech mean the pitch detector is not seeing the voice.
+int vf_voiced_percent(VFEngine *e);
+
 #ifdef __cplusplus
 }
 #endif

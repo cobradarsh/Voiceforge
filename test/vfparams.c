@@ -29,7 +29,7 @@ int main(int argc, char **argv) {
     float *x = malloc(n * sizeof(float));
     for (int i = 0; i < n; i++) x[i] = ((int16_t)(d[dataOff + 2 * ch * i] | d[dataOff + 2 * ch * i + 1] << 8)) / 32768.0f;
 
-    VFParams prm = { (float)atof(argv[3]), (float)atof(argv[4]), argc > 5 ? (float)atof(argv[5]) : 0, argc > 6 ? (float)atof(argv[6]) : 0 };
+    VFParams prm = { (float)atof(argv[3]), (float)atof(argv[4]), argc > 5 ? (float)atof(argv[5]) : 0, argc > 6 ? (float)atof(argv[6]) : 0, 0 };
     VFEngine *e = vf_create(rate);
     vf_set_params(e, prm);
     for (int i = 0; i < n; i += 240) vf_process(e, x + i, n - i < 240 ? n - i : 240);

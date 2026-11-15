@@ -42,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.8.0"
+#define VF_VERSION "0.9.0"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -52,7 +52,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 #define VF_DIAG_PREFIX    "com.voiceforge.diag."
 #define VF_DIAG_SLOTS     16
 #define VF_DIAG_PATH      @"/var/mobile/Documents/VoiceForge-diagnostics.txt"
-enum { VF_DIAG_LOAD = 1, VF_DIAG_UNIT = 2, VF_DIAG_CONVERTER = 3, VF_DIAG_PROCESSING = 4 };
+enum { VF_DIAG_LOAD = 1, VF_DIAG_UNIT = 2, VF_DIAG_CONVERTER = 3, VF_DIAG_PROCESSING = 4, VF_DIAG_VOICED = 5 };
 
 // =====================================================================================
 // SpringBoard side
@@ -122,6 +122,10 @@ static NSString *vf_diag_describe(uint64_t a, uint64_t b) {
         case VF_DIAG_CONVERTER:
             return [NSString stringWithFormat:@"%@ converter %@ -> %@ (%@) in=%dkHz out=%@ frames~%d | audio-inCall=%d",
                     proc, vf_cc((uint32_t)(a >> 32)), vf_cc((uint32_t)a), fn == 1 ? @"convert" : @"fill", bus, fmt, frames, inCall];
+        case VF_DIAG_VOICED:
+            return [NSString stringWithFormat:@"%@ voice tracking on %@/%@: pitch found in %d%% of speech over the last ~10 s%@",
+                    proc, vf_cc((uint32_t)(a >> 32)), vf_cc((uint32_t)a), bus,
+                    bus < 30 ? @"  <-- LOW: the engine is barely changing the voice" : @""];
         default:
             return [NSString stringWithFormat:@"%@ unknown event 0x%llx 0x%llx", proc, a, b];
     }
@@ -418,6 +422,7 @@ typedef struct {
     uint32_t reportedGen;                // diagnostics generation last reported
     uint32_t callsSinceReport;
     uint32_t lastSeen;                   // sTick when the unit was last handled
+    uint32_t procCalls;                  // buffers processed since the last voicing report
     VFEngine *engine;
     float *scratch;
 } VFSlot;
@@ -697,6 +702,12 @@ static void vf_handle(AudioUnit unit, int fn, UInt32 bus, UInt32 frames, AudioBu
                      vf_diag_word(VF_DIAG_PROCESSING, fn, (UInt32)VF_ST_PRESET(st), &s->fmt, frames, match, wantProcess));
     }
     vf_process_abl(s, abl, frames);
+    // every ~10 s of processing, report how much of the speech the engine is tracking
+    if (++s->procCalls >= 1000) {
+        s->procCalls = 0;
+        vf_diag_send(((uint64_t)s->desc.componentType << 32) | s->desc.componentSubType,
+                     vf_diag_word(VF_DIAG_VOICED, fn, (UInt32)vf_voiced_percent(s->engine), &s->fmt, frames, match, wantProcess));
+    }
 }
 
 static void vf_release_unit(AudioComponentInstance unit) {
