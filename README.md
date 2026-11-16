@@ -60,6 +60,10 @@ Narrator, Dark Lord, Tenor, Smurf, Chipmunk and Custom. **Custom** opens the pit
 (0.7 - 2.0) for fine-tuning; formants follow the pitch automatically. Turn the button off with
 Settings -> VoiceForge -> In-call button.
 
+If [CallHider](https://github.com/cobradarsh/CallHider) is installed, the pill is not shown for a
+call from a caller CallHider hides. An incoming call's pill appears once the system has named the
+caller (normally a fraction of a second, at most two seconds), so a hidden caller never flashes it.
+
 ## Finding the call audio path (first-time setup)
 
 **On iOS 15-18 the call mic audio runs through a chain of audio-effect units in `mediaserverd`**, not

@@ -42,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.9.3"
+#define VF_VERSION "0.9.4"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -60,6 +60,7 @@ enum { VF_DIAG_LOAD = 1, VF_DIAG_UNIT = 2, VF_DIAG_CONVERTER = 3, VF_DIAG_PROCES
 
 static int sSBStateToken = -1, sSBTargetToken = -1;
 static BOOL sInCall;
+static BOOL sIncomingCall;   // at least one live call is incoming (only those can be hidden by CallHider)
 
 static dispatch_queue_t sSBDiagQueue;
 static int sSBDiagA[VF_DIAG_SLOTS], sSBDiagB[VF_DIAG_SLOTS];
@@ -367,13 +368,15 @@ static void vf_apply_selection(int preset, int pitchX100);
 }
 
 - (void)update {
-    BOOL active = NO;
+    BOOL active = NO, incoming = NO;
     for (CXCall *call in self.observer.calls) {
         if (call.hasEnded) { [self.decided removeObjectForKey:call.UUID]; continue; }
         active = YES;
+        if (!call.isOutgoing) incoming = YES;
         [self applyDefaultVoiceFor:call];
     }
     sInCall = active;
+    sIncomingCall = incoming;
     vf_publish();
     vf_update_call_timers();
     [[VFInCallUI shared] callStateChanged];
@@ -433,6 +436,12 @@ static void vf_springboard_init(void) {
         vf_observe_select([NSString stringWithFormat:@"pitch.%d", kSelectPitches[i]]);
     dispatch_async(dispatch_get_main_queue(), ^{
         sCallWatcher = [VFCallWatcher new];
+        // TUCallCenter names the caller a moment after CallKit announces the call; the
+        // overlay waits for that before it decides whether to show (see CallHider integration).
+        for (NSString *name in @[ @"TUCallCenterCallStatusChangedNotification", @"TUCallCenterVideoCallStatusChangedNotification" ]) {
+            [NSNotificationCenter.defaultCenter addObserverForName:name object:nil queue:NSOperationQueue.mainQueue
+                                                        usingBlock:^(NSNotification *note) { [[VFInCallUI shared] callStateChanged]; }];
+        }
     });
 }
 
@@ -865,13 +874,20 @@ static NSString *vf_short_title(int preset) {
 
 // --- CallHider integration ---------------------------------------------------
 // Don't show the in-call overlay for callers CallHider is hiding. We ask
-// TUCallCenter for the current non-outgoing call and match its handle/contact
+// TUCallCenter for the live calls and match each incoming one's handle/contact
 // against CallHider's shared hidden list (com.cobradarsh.callhider).
+//
+// CallKit announces a new call a moment before SpringBoard's TUCallCenter can
+// name the caller (every ring logs "caller not identifiable yet"). Asked at that
+// instant, the answer is "can't tell", so the overlay is held back until
+// TUCallCenter names the caller (its status notification asks again) or a short
+// grace period runs out.
 @interface VFTUHandle : NSObject
 @property (nonatomic, readonly, copy) NSString *value;
 @end
 @interface VFTUCall : NSObject
 @property (nonatomic, readonly, getter=isOutgoing) BOOL outgoing;
+@property (nonatomic, readonly) int status;
 @property (nonatomic, readonly) VFTUHandle *handle;
 @property (nonatomic, readonly, copy) NSString *contactIdentifier;
 @end
@@ -903,32 +919,55 @@ static int vf_classify_current_call(void) {
     return -1;
 }
 
-static BOOL vf_call_hidden_by_callhider(void) {
+static BOOL vf_entry_matches(NSDictionary *entry, NSString *cid, NSString *num) {
+    if (![entry isKindOfClass:NSDictionary.class]) return NO;
+    id eid = entry[@"id"];
+    if (cid.length && [eid isKindOfClass:NSString.class] && [eid isEqualToString:cid]) return YES;
+    NSArray *numbers = entry[@"numbers"];
+    if (!num.length || ![numbers isKindOfClass:NSArray.class]) return NO;
+    for (NSString *n in numbers)
+        if ([n isKindOfClass:NSString.class] && n.length && ([num hasSuffix:n] || [n hasSuffix:num])) return YES;
+    return NO;
+}
+
+enum {
+    VF_HIDDEN_UNKNOWN = -1,   // an incoming call exists, but TUCallCenter cannot name its caller yet
+    VF_HIDDEN_NO = 0,         // there is a call the user can see (or CallHider is off / has no list)
+    VF_HIDDEN_YES = 1,        // the only live calls are from callers CallHider hides
+};
+
+static int vf_calls_hidden_by_callhider(void) {
     CFStringRef dom = CFSTR("com.cobradarsh.callhider");
     CFPreferencesAppSynchronize(dom);
     id en = (__bridge_transfer id)CFPreferencesCopyValue(CFSTR("enabled"), dom, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    if (en != nil && ![en boolValue]) return NO;
+    if (en != nil && ![en boolValue]) return VF_HIDDEN_NO;
     NSArray *hidden = (__bridge_transfer NSArray *)CFPreferencesCopyValue(CFSTR("hiddenContacts"), dom, kCFPreferencesCurrentUser, kCFPreferencesAnyHost);
-    if (![hidden isKindOfClass:NSArray.class] || hidden.count == 0) return NO;
+    if (![hidden isKindOfClass:NSArray.class] || hidden.count == 0) return VF_HIDDEN_NO;
 
     Class ccCls = NSClassFromString(@"TUCallCenter");
     id center = [ccCls respondsToSelector:@selector(sharedInstance)] ? [ccCls sharedInstance] : nil;
+    if (!center || ![center respondsToSelector:@selector(currentCalls)]) return VF_HIDDEN_NO;
+    BOOL sawHidden = NO;
     for (VFTUCall *call in [center currentCalls]) {
         @try {
-            if (call.isOutgoing) continue;
+            int st = [call respondsToSelector:@selector(status)] ? call.status : 0;
+            if (st == 5 || st == 6) continue;                    // disconnecting / disconnected: not a live call
+            if (call.isOutgoing) return VF_HIDDEN_NO;            // a call the user placed
             NSString *cid = call.contactIdentifier;
             NSString *num = vf_last10(call.handle.value);
-            for (NSDictionary *e in hidden) {
-                if (![e isKindOfClass:NSDictionary.class]) continue;
-                id eid = e[@"id"];
-                if (cid.length && [eid isKindOfClass:NSString.class] && [eid isEqualToString:cid]) return YES;
-                if (num.length) for (NSString *n in e[@"numbers"])
-                    if ([n isKindOfClass:NSString.class] && n.length && ([num hasSuffix:n] || [n hasSuffix:num])) return YES;
-            }
+            if (!cid.length && !num.length) continue;            // not named yet (or a withheld number)
+            BOOL match = NO;
+            for (NSDictionary *entry in hidden)
+                if (vf_entry_matches(entry, cid, num)) { match = YES; break; }
+            if (!match) return VF_HIDDEN_NO;                     // an incoming call from someone who is not hidden
+            sawHidden = YES;
         } @catch (__unused NSException *e) {}
     }
-    return NO;
+    return sawHidden ? VF_HIDDEN_YES : VF_HIDDEN_UNKNOWN;
 }
+
+// How long an incoming call may stay unnamed before the overlay is shown anyway.
+#define VF_NAME_GRACE_SECONDS 2.0
 
 @implementation VFInCallUI {
     VFOverlayWindow *_window;
@@ -943,6 +982,9 @@ static BOOL vf_call_hidden_by_callhider(void) {
     int _shownPreset;
     int _shownPitch;   // x100
     BOOL _enabled;
+    CFAbsoluteTime _unnamedSince;   // when the current incoming call was first found unnamed (0 = not waiting)
+    BOOL _recheckPending;
+    int _overlayNote;               // last overlay decision written to the diagnostics file
 }
 
 + (instancetype)shared {
@@ -968,12 +1010,55 @@ static BOOL vf_call_hidden_by_callhider(void) {
     _enabled = vf_pref_bool(@"enabled", YES);
 }
 
-// called by the call watcher whenever any call starts or ends
+// called by the call watcher whenever any call starts or ends, and whenever
+// TUCallCenter learns more about a call
 - (void)callStateChanged {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (sInCall && vf_pref_bool(@"inCallButton", YES) && !vf_call_hidden_by_callhider()) [self show];
-        else [self hide];
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ [self decide]; });
+}
+
+// one diagnostics line per change of decision
+- (void)note:(int)decision text:(NSString *)text {
+    if (decision == _overlayNote) return;
+    _overlayNote = decision;
+    if (text) vf_diag_write(text);
+}
+
+// main queue
+- (void)decide {
+    if (!sInCall || !vf_pref_bool(@"inCallButton", YES)) {
+        _unnamedSince = 0;
+        [self note:0 text:nil];
+        [self hide];
+        return;
+    }
+    // only an incoming call can be one CallHider hides
+    int hidden = sIncomingCall ? vf_calls_hidden_by_callhider() : VF_HIDDEN_NO;
+    if (hidden == VF_HIDDEN_UNKNOWN) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        if (_unnamedSince == 0) _unnamedSince = now;
+        if (now - _unnamedSince < VF_NAME_GRACE_SECONDS) {
+            // Leave the screen as it is and ask again shortly; TUCallCenter's own
+            // notification usually gets here first.
+            [self note:1 text:@"OVERLAY held back: waiting for the caller's identity"];
+            if (!_recheckPending) {
+                _recheckPending = YES;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    self->_recheckPending = NO;
+                    [self decide];
+                });
+            }
+            return;
+        }
+        hidden = VF_HIDDEN_NO;   // never named (e.g. a withheld number): treat it like any other call
+    }
+    _unnamedSince = 0;
+    if (hidden == VF_HIDDEN_YES) {
+        [self note:2 text:@"OVERLAY not shown: the caller is hidden by CallHider"];
+        [self hide];
+    } else {
+        [self note:3 text:@"OVERLAY shown"];
+        [self show];
+    }
 }
 
 - (void)refreshFromPrefs {
