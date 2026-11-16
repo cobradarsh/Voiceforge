@@ -43,6 +43,14 @@ With Theos installed locally: `make package FINALPACKAGE=1` (roothide by default
 3. Settings → VoiceForge → pick a **Voice**. It applies to your microphone while a call is active
    and can be changed mid-call.
 
+### Unknown numbers
+
+With **Auto voice for unknown numbers** on (default), a call with a number that is not in your
+Contacts starts with the **Default voice for unknown numbers** (Settings, default Female), and a
+call with a saved contact starts with the voice off. Either can be changed during the call from the
+button. The caller is identified through the system's call centre; if it cannot be identified at
+the moment the call starts, the current voice is left unchanged.
+
 ### In-call button
 
 During **any** call, cellular or VoIP (WhatsApp, FaceTime, etc.), a purple **VoiceForge** pill

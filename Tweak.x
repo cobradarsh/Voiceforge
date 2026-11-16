@@ -42,7 +42,7 @@ enum { VF_FN_ANY = 0, VF_FN_RENDER = 1, VF_FN_PROCESS = 2, VF_FN_PROCESS_MULTI =
 
 #define VFLog(fmt, ...) os_log_error(OS_LOG_DEFAULT, "VoiceForge: " fmt, ##__VA_ARGS__)
 
-#define VF_VERSION "0.9.2"
+#define VF_VERSION "0.9.3"
 
 // Diagnostics: the audio server reports events as two 64-bit words through a ring of notify
 // names ("com.voiceforge.diag.N" + ".a"/".b"); SpringBoard writes them to a text file.
@@ -318,7 +318,15 @@ static void vf_publish(void) {
 - (void)refreshFromPrefs;
 @end
 
+// 1 = the current call is with a number not in Contacts, 0 = a saved contact, -1 = can't tell yet
+static int vf_classify_current_call(void);
+static void vf_apply_selection(int preset, int pitchX100);
+
 @interface VFCallWatcher : NSObject <CXCallObserverDelegate>
+@property (nonatomic, strong) NSMutableDictionary<NSUUID *, NSNumber *> *decided;   // call -> classification applied
+@end
+@interface VFCallWatcher ()
+- (void)applyDefaultVoiceFor:(CXCall *)call;
 @property (nonatomic, strong) CXCallObserver *observer;
 @end
 
@@ -334,10 +342,37 @@ static void vf_publish(void) {
 - (void)callObserver:(CXCallObserver *)observer callChanged:(CXCall *)call {
     [self update];
 }
+// At the start of a call: unknown number -> the default voice chosen in Settings, saved
+// contact -> voice off. The user can still change it from the button during the call.
+- (void)applyDefaultVoiceFor:(CXCall *)call {
+    if (!vf_pref_bool(@"autoUnknown", YES)) return;
+    if (!self.decided) self.decided = [NSMutableDictionary dictionary];
+    NSNumber *prev = self.decided[call.UUID];
+    if (prev && prev.intValue >= 0) return;                    // already decided for this call
+    if (prev && call.hasConnected == NO) return;                // undetermined: retry once it connects
+    int cls = vf_classify_current_call();
+    self.decided[call.UUID] = @(cls);
+    if (cls < 0) {
+        vf_diag_write(@"CALL start: caller not identifiable yet, leaving the voice as it is");
+        return;
+    }
+    int preset = 0;
+    if (cls == 1) {
+        preset = (int)vf_pref_double(@"unknownPreset", VF_PRESET_FEMALE);
+        if (preset < 0 || preset >= VF_PRESET_COUNT) preset = VF_PRESET_FEMALE;
+    }
+    vf_apply_selection(preset, 0);
+    vf_diag_write([NSString stringWithFormat:@"CALL start: %@ -> voice %s", cls == 1 ? @"unknown number" : @"saved contact",
+                   vf_preset_name((VFPreset)preset)]);
+}
+
 - (void)update {
     BOOL active = NO;
-    for (CXCall *call in self.observer.calls)
-        if (!call.hasEnded) active = YES;
+    for (CXCall *call in self.observer.calls) {
+        if (call.hasEnded) { [self.decided removeObjectForKey:call.UUID]; continue; }
+        active = YES;
+        [self applyDefaultVoiceFor:call];
+    }
     sInCall = active;
     vf_publish();
     vf_update_call_timers();
@@ -851,6 +886,21 @@ static NSString *vf_last10(NSString *raw) {
     for (NSUInteger i = 0; i < raw.length; i++) { unichar c = [raw characterAtIndex:i]; if (c >= '0' && c <= '9') [d appendFormat:@"%C", c]; }
     if (d.length == 0) return nil;
     return d.length > 10 ? [d substringFromIndex:d.length - 10] : d;
+}
+
+static int vf_classify_current_call(void) {
+    Class ccCls = NSClassFromString(@"TUCallCenter");
+    id center = [ccCls respondsToSelector:@selector(sharedInstance)] ? [ccCls sharedInstance] : nil;
+    if (!center || ![center respondsToSelector:@selector(currentCalls)]) return -1;
+    for (VFTUCall *call in [center currentCalls]) {
+        @try {
+            NSString *cid = [call respondsToSelector:@selector(contactIdentifier)] ? call.contactIdentifier : nil;
+            if (cid.length) return 0;                                   // resolved to a Contacts entry
+            NSString *num = [call respondsToSelector:@selector(handle)] ? call.handle.value : nil;
+            if (num.length) return 1;                                   // a number, no contact behind it
+        } @catch (__unused NSException *e) {}
+    }
+    return -1;
 }
 
 static BOOL vf_call_hidden_by_callhider(void) {
