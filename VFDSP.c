@@ -58,8 +58,10 @@ struct VFEngine {
     VFParams cur, pending;
     int dirty, active;
 
-    float b0, b1, b2, a1, a2, z1, z2;   // low shelf
+    struct { float b0, b1, b2, a1, a2, z1, z2; } lowShelf, midBell, airShelf;
     float outGain;
+    uint32_t noise;                 // xorshift state for breath
+    float breathHp, breathHpIn, breathEnv, breathPole, breathDecay;
 };
 
 static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] = {
@@ -67,15 +69,16 @@ static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] 
     [VF_PRESET_DARK_LORD]     = { "Dark Lord",     { 0.62f, 0.75f,  3.0f,  1.0f, 0.0f } },
     [VF_PRESET_TENOR]         = { "Tenor",         { 0.80f, 0.84f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_NARRATOR]      = { "Deep Narrator", { 0.82f, 0.90f,  5.0f,  1.0f, 0.0f } },
-    [VF_PRESET_FEMALE]        = { "Female",        { 1.75f, 1.15f, -1.0f,  0.0f, 0.0f } },
+    [VF_PRESET_FEMALE]        = { "Female",        { 1.85f, 1.10f, -1.0f,  0.0f, 0.0f,  -3.5f, 3.0f, 0.05f } },
     [VF_PRESET_SMURF]         = { "Smurf",         { 1.60f, 1.45f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_CHIPMUNK]      = { "Chipmunk",      { 2.20f, 1.80f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_CUSTOM]        = { "Custom",        { 1.00f, 1.00f,  0.0f,  0.0f, 0.0f } },
     // Female variants: pitch and vocal-tract size fall with age; the senior voice adds a slow tremor.
     // Formant ratios kept modest (<= 1.2): larger values make the voice sound nasal/pinched.
-    [VF_PRESET_FEMALE_YOUNG]  = { "Young Female",  { 1.95f, 1.20f, -2.0f,  0.0f, 0.0f } },
-    [VF_PRESET_FEMALE_MATURE] = { "Mature Female", { 1.60f, 1.10f,  0.0f,  0.0f, 0.0f } },
-    [VF_PRESET_FEMALE_SENIOR] = { "Senior Female", { 1.45f, 1.06f,  0.5f, -1.0f, 0.03f } },
+    //                                                pitch  formant bass  gain tremor  mid    air  breath
+    [VF_PRESET_FEMALE_YOUNG]  = { "Young Female",  { 2.05f, 1.14f, -2.0f,  0.0f, 0.0f,  -3.5f, 4.0f, 0.06f } },
+    [VF_PRESET_FEMALE_MATURE] = { "Mature Female", { 1.65f, 1.06f,  0.0f,  0.0f, 0.0f,  -3.0f, 2.0f, 0.04f } },
+    [VF_PRESET_FEMALE_SENIOR] = { "Senior Female", { 1.45f, 1.03f,  0.5f, -1.0f, 0.03f, -2.0f, 0.0f, 0.08f } },
 };
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
@@ -97,23 +100,52 @@ const char *vf_preset_name(VFPreset preset) {
 
 static int is_identity(VFParams p) {
     return fabsf(p.pitch - 1.0f) < 1e-3f && fabsf(p.formant - 1.0f) < 1e-3f &&
-           fabsf(p.bassDb) < 1e-3f && fabsf(p.gainDb) < 1e-3f && p.tremor <= 0;
+           fabsf(p.bassDb) < 1e-3f && fabsf(p.gainDb) < 1e-3f && p.tremor <= 0 &&
+           fabsf(p.midDb) < 1e-3f && fabsf(p.airDb) < 1e-3f && p.breath <= 0;
 }
 
 // ---------------------------------------------------------------- setup
 
+typedef struct { float b0, b1, b2, a1, a2, z1, z2; } VFBiquad;
+
+static void set_coeffs(VFBiquad *f, float b0, float b1, float b2, float a0, float a1, float a2) {
+    f->b0 = b0 / a0; f->b1 = b1 / a0; f->b2 = b2 / a0; f->a1 = a1 / a0; f->a2 = a2 / a0;
+}
+
+static void design_low_shelf(VFBiquad *f, double sr, float hz, float dB) {
+    float A = powf(10.0f, dB / 40.0f), w0 = 2.0f * (float)VF_PI * hz / (float)sr;
+    float cs = cosf(w0), sA = 2.0f * sqrtf(A) * sinf(w0) / 2.0f * sqrtf(2.0f);
+    set_coeffs(f, A * ((A + 1) - (A - 1) * cs + sA), 2 * A * ((A - 1) - (A + 1) * cs), A * ((A + 1) - (A - 1) * cs - sA),
+               (A + 1) + (A - 1) * cs + sA, -2 * ((A - 1) + (A + 1) * cs), (A + 1) + (A - 1) * cs - sA);
+}
+
+static void design_high_shelf(VFBiquad *f, double sr, float hz, float dB) {
+    float A = powf(10.0f, dB / 40.0f), w0 = 2.0f * (float)VF_PI * hz / (float)sr;
+    float cs = cosf(w0), sA = 2.0f * sqrtf(A) * sinf(w0) / 2.0f * sqrtf(2.0f);
+    set_coeffs(f, A * ((A + 1) + (A - 1) * cs + sA), -2 * A * ((A - 1) + (A + 1) * cs), A * ((A + 1) + (A - 1) * cs - sA),
+               (A + 1) - (A - 1) * cs + sA, 2 * ((A - 1) - (A + 1) * cs), (A + 1) - (A - 1) * cs - sA);
+}
+
+static void design_peak(VFBiquad *f, double sr, float hz, float q, float dB) {
+    float A = powf(10.0f, dB / 40.0f), w0 = 2.0f * (float)VF_PI * hz / (float)sr;
+    float cs = cosf(w0), alpha = sinf(w0) / (2.0f * q);
+    set_coeffs(f, 1 + alpha * A, -2 * cs, 1 - alpha * A, 1 + alpha / A, -2 * cs, 1 - alpha / A);
+}
+
+static inline float run_biquad(VFBiquad *f, float x) {
+    float y = f->b0 * x + f->z1;
+    f->z1 = f->b1 * x - f->a1 * y + f->z2;
+    f->z2 = f->b2 * x - f->a2 * y;
+    return y;
+}
+
 static void update_filter(VFEngine *e) {
-    float A = powf(10.0f, e->cur.bassDb / 40.0f);
-    float w0 = 2.0f * (float)VF_PI * 180.0f / (float)e->sr;
-    float cs = cosf(w0), alpha = sinf(w0) / 2.0f * sqrtf(2.0f);
-    float sA = 2.0f * sqrtf(A) * alpha;
-    float a0 = (A + 1) + (A - 1) * cs + sA;
-    e->b0 = A * ((A + 1) - (A - 1) * cs + sA) / a0;
-    e->b1 = 2 * A * ((A - 1) - (A + 1) * cs) / a0;
-    e->b2 = A * ((A + 1) - (A - 1) * cs - sA) / a0;
-    e->a1 = -2 * ((A - 1) + (A + 1) * cs) / a0;
-    e->a2 = ((A + 1) + (A - 1) * cs - sA) / a0;
+    design_low_shelf((VFBiquad *)&e->lowShelf, e->sr, 180.0f, e->cur.bassDb);
+    design_peak((VFBiquad *)&e->midBell, e->sr, 1800.0f, 0.9f, e->cur.midDb);     // the pinched/nasal band
+    design_high_shelf((VFBiquad *)&e->airShelf, e->sr, 5000.0f, e->cur.airDb);
     e->outGain = powf(10.0f, e->cur.gainDb / 20.0f);
+    e->breathPole = expf(-2.0f * (float)VF_PI * 2500.0f / (float)e->sr);      // breath noise is high-passed
+    e->breathDecay = expf(-1.0f / (0.012f * (float)e->sr));                   // 12 ms level follower
 }
 
 VFEngine *vf_create(double sampleRate) {
@@ -182,7 +214,9 @@ void vf_reset(VFEngine *e) {
     e->voicedHold = 0;
     e->tremorPhase = 0;
     e->statSpeech = e->statVoiced = 0;
-    e->z1 = e->z2 = 0;
+    e->lowShelf.z1 = e->lowShelf.z2 = e->midBell.z1 = e->midBell.z2 = e->airShelf.z1 = e->airShelf.z2 = 0;
+    e->noise = 0x9E3779B9u;
+    e->breathHp = e->breathHpIn = e->breathEnv = 0;
 }
 
 int vf_voiced_percent(VFEngine *e) {
@@ -359,10 +393,20 @@ void vf_process(VFEngine *e, float *buf, int n) {
         if (!e->active) continue;
 
         float y = process_sample(e, buf[i]);
-        // low shelf (transposed direct form II)
-        float s = e->b0 * y + e->z1;
-        e->z1 = e->b1 * y - e->a1 * s + e->z2;
-        e->z2 = e->b2 * y - e->a2 * s;
-        buf[i] = soft_limit(s * e->outGain);
+        y = run_biquad((VFBiquad *)&e->lowShelf, y);
+        y = run_biquad((VFBiquad *)&e->midBell, y);
+        y = run_biquad((VFBiquad *)&e->airShelf, y);
+        if (e->cur.breath > 0) {
+            // aspiration: high-passed noise following the voice's own level, so it sits under
+            // the speech and vanishes in silence
+            e->noise ^= e->noise << 13; e->noise ^= e->noise >> 17; e->noise ^= e->noise << 5;
+            float n = (float)(int32_t)e->noise * (1.0f / 2147483648.0f);
+            float hp = n - e->breathHpIn + e->breathPole * e->breathHp;
+            e->breathHpIn = n; e->breathHp = hp;
+            float a = fabsf(y);
+            e->breathEnv = a > e->breathEnv ? a : e->breathEnv * e->breathDecay;
+            y += e->cur.breath * e->breathEnv * hp * 3.0f;
+        }
+        buf[i] = soft_limit(y * e->outGain);
     }
 }

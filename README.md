@@ -8,10 +8,10 @@ Written from scratch; it shares no code with VoiceChanger XS.
 | Voice | Pitch | Formant | Notes |
 |---|---|---|---|
 | Normal (Off) | 1.00 | 1.00 | pass-through |
-| Female | 1.75 | 1.15 | raised pitch and vocal-tract size for a feminine voice |
-| Young Female | 1.95 | 1.20 | light, bright young woman |
-| Mature Female | 1.60 | 1.10 | fuller middle-aged woman |
-| Senior Female | 1.45 | 1.06 | older woman: lower, softer, with a slow vocal tremor |
+| Female | 1.85 | 1.10 | feminine: softened 1.8 kHz band, added air and light breathiness |
+| Young Female | 2.05 | 1.14 | light, bright young woman |
+| Mature Female | 1.65 | 1.06 | fuller middle-aged woman |
+| Senior Female | 1.45 | 1.03 | older woman: lower, breathier, with a slow vocal tremor |
 | Deep Narrator | 0.82 | 0.90 | ~3.5 semitones down, +5 dB warmth at 180 Hz |
 | Dark Lord | 0.62 | 0.75 | monster voice |
 | Tenor | 0.80 | 0.80 | classic pitch-down |

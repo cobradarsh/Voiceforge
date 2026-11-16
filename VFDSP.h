@@ -26,6 +26,9 @@ typedef struct {
     float bassDb;    // low-shelf gain at ~180 Hz
     float gainDb;    // output gain before the soft limiter
     float tremor;    // slow pitch wobble depth (0 = none, 0.03 = +-3 %), ~5.5 Hz
+    float midDb;     // bell at ~1.8 kHz; negative softens the pinched/nasal band
+    float airDb;     // high shelf above ~5 kHz; positive adds openness
+    float breath;    // aspiration noise mixed in under the voice (0 = none, ~0.05 = subtle)
 } VFParams;
 
 typedef struct VFEngine VFEngine;
