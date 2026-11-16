@@ -67,14 +67,15 @@ static const struct { const char *name; VFParams p; } kPresets[VF_PRESET_COUNT] 
     [VF_PRESET_DARK_LORD]     = { "Dark Lord",     { 0.62f, 0.75f,  3.0f,  1.0f, 0.0f } },
     [VF_PRESET_TENOR]         = { "Tenor",         { 0.80f, 0.84f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_NARRATOR]      = { "Deep Narrator", { 0.82f, 0.90f,  5.0f,  1.0f, 0.0f } },
-    [VF_PRESET_FEMALE]        = { "Female",        { 1.75f, 1.25f, -2.0f,  0.0f, 0.0f } },
+    [VF_PRESET_FEMALE]        = { "Female",        { 1.75f, 1.15f, -1.0f,  0.0f, 0.0f } },
     [VF_PRESET_SMURF]         = { "Smurf",         { 1.60f, 1.45f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_CHIPMUNK]      = { "Chipmunk",      { 2.20f, 1.80f,  0.0f,  0.0f, 0.0f } },
     [VF_PRESET_CUSTOM]        = { "Custom",        { 1.00f, 1.00f,  0.0f,  0.0f, 0.0f } },
     // Female variants: pitch and vocal-tract size fall with age; the senior voice adds a slow tremor.
-    [VF_PRESET_FEMALE_YOUNG]  = { "Young Female",  { 1.95f, 1.30f, -3.0f,  0.0f, 0.0f } },
-    [VF_PRESET_FEMALE_MATURE] = { "Mature Female", { 1.60f, 1.20f, -1.0f,  0.0f, 0.0f } },
-    [VF_PRESET_FEMALE_SENIOR] = { "Senior Female", { 1.45f, 1.15f,  0.0f, -1.0f, 0.03f } },
+    // Formant ratios kept modest (<= 1.2): larger values make the voice sound nasal/pinched.
+    [VF_PRESET_FEMALE_YOUNG]  = { "Young Female",  { 1.95f, 1.20f, -2.0f,  0.0f, 0.0f } },
+    [VF_PRESET_FEMALE_MATURE] = { "Mature Female", { 1.60f, 1.10f,  0.0f,  0.0f, 0.0f } },
+    [VF_PRESET_FEMALE_SENIOR] = { "Senior Female", { 1.45f, 1.06f,  0.5f, -1.0f, 0.03f } },
 };
 
 static float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }

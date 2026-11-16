@@ -99,7 +99,7 @@
 			<key>label</key>
 			<string>Custom voice</string>
 			<key>footerText</key>
-			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Young Female is pitch 1.95 / formant 1.30, Female 1.75 / 1.25, Mature Female 1.60 / 1.20, Senior Female 1.45 / 1.15, Deep Narrator 0.82 / 0.90. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
+			<string>Used when Voice is Custom. Pitch moves the note you speak at; Formant moves the size of the voice. For reference: Young Female is pitch 1.95 / formant 1.20, Female 1.75 / 1.15, Mature Female 1.60 / 1.10, Senior Female 1.45 / 1.06, Deep Narrator 0.82 / 0.90. Higher formant values sound more nasal. Keeping formant between 1.0 and the pitch value sounds most natural.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
